@@ -1,0 +1,495 @@
+"""
+Full Shadow Link v3 verification test suite.
+Tests:
+  A. Engine Layer (tokenization, classification, SQLite connections, weight decay)
+  B. MCP Server (exposes tools over stdio)
+  C. Capture Hook (simulated UserPromptSubmit event, capture + ghost prediction)
+  D. Prompt Wrapper (mock run session of subprocess wrapper)
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Add local path so we test v3 code
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+PASS, FAIL = "PASS", "FAIL"
+results = []
+
+def check(name, cond):
+    results.append((name, PASS if cond else FAIL))
+    print(f"  [{PASS if cond else FAIL}] {name}")
+
+# ------------------------------------------------------------------
+# A. Engine layer
+# ------------------------------------------------------------------
+def test_engine():
+    print("\nA. ENGINE LAYER")
+    from shadow_link.database import Database
+    from shadow_link.engine import Engine
+    from shadow_link.ingester import classify_multi
+    
+    # classify_multi test
+    buckets = classify_multi("That's wrong and bloated — remove the boilerplate, you missed the endpoint.")
+    check("classify_multi returns multiple buckets", len(buckets) >= 2)
+    check("buckets include rejection", "rejection" in buckets)
+    check("buckets include correction", "correction" in buckets)
+
+    # database & matching test
+    test_db = ROOT / "_test_v3_engine.db"
+    if test_db.exists():
+        test_db.unlink()
+        
+    db = Database(test_db)
+    eng = Engine(db)
+    pid = db.add_prompt(
+        text="remove the boilerplate, you missed the endpoint",
+        bucket=buckets[0],
+        metadata={"buckets": buckets},
+    )
+
+    # match via secondary bucket
+    hits = eng.match("you missed the endpoint boilerplate", top_k=5, threshold=0.0, buckets=["correction"])
+    check("multi-bucket match finds row via secondary bucket", any(h.prompt_id == pid for h in hits))
+
+    # reinforce test
+    w1 = db.reinforce(pid, bump=0.5)
+    check("reinforce increases weight", w1 > 1.0)
+    w2 = db.reinforce(pid, bump=100.0)
+    check("reinforce caps weight", w2 <= 5.0)
+
+    if test_db.exists():
+        test_db.unlink()
+
+# ------------------------------------------------------------------
+# B. MCP Server (stdio)
+# ------------------------------------------------------------------
+async def test_mcp():
+    print("\nB. MCP SERVER (stdio)")
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    test_db = ROOT / "_test_v3_mcp.db"
+    if test_db.exists():
+        test_db.unlink()
+        
+    env = dict(os.environ)
+    env["DB_PATH"] = str(test_db)
+    env["GLOBAL_THRESHOLD"] = "0.05"  # low threshold for strict query mapping
+
+    # Point to the v3 mcp server command
+    params = StdioServerParameters(command=sys.executable, args=[str(ROOT / "shadow_link" / "mcp_server.py")], env=env)
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            names = {t.name for t in (await session.list_tools()).tools}
+            check("all six tools exposed by FastMCP", 
+                  names == {"shadow_log", "shadow_query", "shadow_nudge", "shadow_draft", "shadow_accept", "shadow_stats"})
+
+            async def call(tool, args):
+                r = await session.call_tool(tool, args)
+                return json.loads(r.content[0].text)
+
+            # Test shadow_log
+            log_res = await call("shadow_log", {
+                "your_reply": "No — don't wrap the whole thing, only guard the network call.",
+                "agent_output": "I'll add try/except around the whole function.",
+                "goal": "fix flaky upload"
+            })
+            check("shadow_log returns valid response and bucket allocation", log_res.get("logged") and len(log_res["buckets"]) >= 1)
+
+            # Test shadow_draft
+            draft_res = await call("shadow_draft", {
+                "agent_output": "I'll wrap the entire upload function in error handling.",
+                "goal": "fix flaky upload"
+            })
+            check("shadow_draft returns a prediction ghost", draft_res.get("ghost") is not None)
+            check("ghost response carries ID and confidence", "id" in (draft_res.get("ghost") or {}))
+
+            # Test shadow_accept
+            gid = draft_res["ghost"]["id"]
+            accept_res = await call("shadow_accept", {"prompt_id": gid})
+            check("shadow_accept reinforces weight successfully", accept_res.get("reinforced") and accept_res["new_weight"] > 1.0)
+
+            # Test shadow_stats
+            stats_res = await call("shadow_stats", {})
+            check("shadow_stats returns prompt count", stats_res.get("total_prompts", 0) >= 1)
+
+    if test_db.exists():
+        test_db.unlink()
+
+# ------------------------------------------------------------------
+# C. Capture hook
+# ------------------------------------------------------------------
+def test_hook():
+    print("\nC. CAPTURE HOOK")
+    test_db = ROOT / "_test_v3_hook.db"
+    if test_db.exists():
+        test_db.unlink()
+
+    transcript = ROOT / "_test_v3_transcript.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "assistant",
+        "message": {"role": "assistant", "content": "I'll wrap the whole function in try/except."},
+    }) + "\n", encoding="utf-8")
+
+    test_prompt = "That's wrong and bloated — remove the boilerplate, only guard the network call."
+    payload = json.dumps({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": test_prompt,
+        "transcript_path": str(transcript),
+        "session_id": "test-v3-session",
+    })
+
+    env = dict(os.environ)
+    env["DB_PATH"] = str(test_db)
+    proc = subprocess.run([sys.executable, str(ROOT / "shadow_hook.py")], input=payload, capture_output=True, text=True, env=env)
+    check("hook runs and exits successfully", proc.returncode == 0)
+
+    # Verify capture happened in DB
+    from shadow_link.database import Database
+    db = Database(test_db)
+    rows = db.all_prompts()
+    captured = any("guard the network call" in r["text"] for r in rows)
+    check("hook successfully captured the situation+reaction pair", captured)
+
+    if captured:
+        row = next(r for r in rows if "guard the network call" in r["text"])
+        meta = json.loads(row["metadata"])
+        check("stored situation context matches", "agent_output" in meta)
+
+    # Run hook again; should output the predicted ghost block
+    proc2 = subprocess.run([sys.executable, str(ROOT / "shadow_hook.py")], input=payload, capture_output=True, text=True, env=env)
+    check("hook can query database to emit a ghost block", "Shadow Link" in proc2.stdout and proc2.returncode == 0)
+
+    for f in (test_db, transcript):
+        if f.exists():
+            f.unlink()
+
+# ------------------------------------------------------------------
+# D. Prompt Wrapper
+# ------------------------------------------------------------------
+async def test_prompt_wrapper():
+    print("\nD. PROMPT WRAPPER")
+    from unittest.mock import AsyncMock, patch
+    from prompt_toolkit.output import DummyOutput
+    from shadow_link.prompt_wrapper import PromptWrapper
+    from shadow_link.database import Database
+
+    test_db = ROOT / "_test_v3_wrapper.db"
+    if test_db.exists():
+        test_db.unlink()
+
+    # Create a wrapper running a simple subprocess that reads stdin and echoes it
+    cmd = [
+        sys.executable, "-c",
+        "import sys; "
+        "val = sys.stdin.readline().strip(); "
+        "print('echo:', val); "
+        "sys.stdout.flush();"
+    ]
+
+    wrapper = PromptWrapper(cmd, test_db, output=DummyOutput())
+
+    # Mock prompt_toolkit's PromptSession.prompt_async
+    mock_prompt = AsyncMock(return_value="hello from test wrapper")
+
+    from prompt_toolkit.application.current import create_app_session
+    with create_app_session(output=DummyOutput()):
+        with patch("prompt_toolkit.PromptSession.prompt_async", mock_prompt):
+            await wrapper.run()
+
+    # Verify that wrapper ran successfully and captured the input in DB
+    check("wrapper database exists", test_db.exists())
+    
+    db = Database(test_db)
+    prompts = db.all_prompts()
+    check("user input captured in wrapper database", any("hello from test wrapper" in p["text"] for p in prompts))
+
+    if test_db.exists():
+        test_db.unlink()
+
+# ------------------------------------------------------------------
+# E. Proxy Payload Optimizer
+# ------------------------------------------------------------------
+def test_proxy_optimizer():
+    print("\nE. PROXY PAYLOAD OPTIMIZER")
+    try:
+        from shadow_link.proxy import optimize_payload
+    except ImportError:
+        print("  [SKIP] mitmproxy is not installed. Skipping proxy optimizer tests.")
+        return
+    import os
+    
+    # Test payload with dynamic date and billing header in system block
+    # and a system reminder message in the messages list
+    payload = {
+        "system": [
+            {"type": "text", "text": "Today's date is June 21, 2026. Keep code simple."},
+            {"type": "text", "text": "x-anthropic-billing-header: test"}
+        ],
+        "messages": [
+            {"role": "user", "content": "<system-reminder>Remember style guide</system-reminder>"},
+            {"role": "user", "content": "Wait, clean it up."}
+        ]
+    }
+    
+    # Run optimizer with injection temporarily disabled for static checks
+    env_backup = os.environ.get("SHADOW_LINK_INJECT")
+    os.environ["SHADOW_LINK_INJECT"] = "false"
+    
+    try:
+        optimized = optimize_payload(payload)
+    finally:
+        if env_backup is not None:
+            os.environ["SHADOW_LINK_INJECT"] = env_backup
+        else:
+            del os.environ["SHADOW_LINK_INJECT"]
+            
+    # Verify that:
+    # 1. Billing header and Date were removed from system block
+    check("billing header and date hoisted from system prompt", len(optimized["system"]) == 0)
+    
+    # 2. They were appended to the final user message along with the system reminder
+    final_content = optimized["messages"][-1]["content"]
+    check("hoisted blocks injected in final user message", "Today's date is" in final_content and "billing-header" in final_content)
+    check("system reminder hoisted into final user message", "Remember style guide" in final_content)
+
+# ------------------------------------------------------------------
+# F. TUI Component Initialization
+# ------------------------------------------------------------------
+def test_tui_initialization():
+    print("\nF. TUI COMPONENT INITIALIZATION")
+    import threading
+    from http.server import HTTPServer
+    from prompt_toolkit.output import DummyOutput
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.formatted_text import to_formatted_text
+    from prompt_toolkit.input import create_pipe_input
+    from shadow_link.tui import DaemonAPIError, ShadowLinkConsole, WatchView
+    from shadow_link.api import ShadowLinkAPIHandler
+    from unittest.mock import patch
+
+    test_db = ROOT / "_test_v3_tui.db"
+    test_audit_dir = ROOT / "_test_v3_audit"
+    if test_db.exists():
+        test_db.unlink()
+    test_audit_dir.mkdir(exist_ok=True)
+    (test_audit_dir / "2026-06-21.jsonl").write_text(json.dumps({
+        "timestamp": "2026-06-21T12:00:00+00:00", "phase": "request",
+        "original_bytes": 1000, "optimized_bytes": 800,
+    }) + "\n", encoding="utf-8")
+    old_env = {key: os.environ.get(key) for key in
+               ("DB_PATH", "SHADOW_LM_MODE", "SHADOW_QUERY_EMBED", "SHADOW_LINK_AUDIT_DIR")}
+    os.environ["DB_PATH"] = str(test_db)
+    os.environ["SHADOW_LM_MODE"] = "0"
+    os.environ["SHADOW_QUERY_EMBED"] = "0"
+    os.environ["SHADOW_LINK_AUDIT_DIR"] = str(test_audit_dir)
+    server = HTTPServer(("127.0.0.1", 0), ShadowLinkAPIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        with create_app_session(output=DummyOutput()):
+            console = ShadowLinkConsole()
+            console.daemon_url = f"http://127.0.0.1:{server.server_address[1]}"
+            check("Console instantiated successfully", console is not None)
+            check("Console initialized config and db correctly", console.config is not None and console.db is not None)
+            check("Console initialized PromptSession session", console.session is not None)
+            check("Console exposes connected command set",
+                  {"/status", "/predict", "/pairs", "/proxy", "/accept", "/reject"}.issubset(console.commands))
+            check("Claude Shadow command replaces claude-watch",
+                  "/claude-shadow" in console.commands and "/claude-watch" not in console.commands)
+            root_completions = list(
+                console.completer.get_completions(Document("/"), None)
+            )
+            root_completion_text = {item.text for item in root_completions}
+            root_meta = {
+                item.text: "".join(part[1] for part in to_formatted_text(item.display_meta))
+                for item in root_completions
+            }
+            check("Slash palette preserves the complete command set",
+                  root_completion_text == set(console.commands))
+            check("Slash palette adds premium command descriptions",
+                  all(root_meta.get(command) for command in console.commands))
+            proxy_completions = list(
+                console.completer.get_completions(Document("/proxy "), None)
+            )
+            check("Slash palette preserves nested proxy actions",
+                  {item.text for item in proxy_completions} ==
+                  {"status", "start", "stop", "view", "setup"})
+            check("Slash palette yields to proxy arguments after an action",
+                  not list(console.completer.get_completions(
+                      Document("/proxy start "), None)))
+            with patch("shadow_link.tui.time.monotonic", return_value=0.0):
+                prompt_frame_a = "".join(fragment[1] for fragment in console._prompt_text())
+            with patch("shadow_link.tui.time.monotonic", return_value=0.13):
+                prompt_frame_b = "".join(fragment[1] for fragment in console._prompt_text())
+            check("Console command prompt carries animated Braille motion",
+                  prompt_frame_a != prompt_frame_b and "shadow-link" in prompt_frame_a)
+            toolbar_text = "".join(fragment[1] for fragment in console._bottom_toolbar_text())
+            check("Console toolbar exposes cached live telemetry",
+                  "memories" in toolbar_text and "Tab" in toolbar_text and "LOCAL" in toolbar_text)
+            with create_pipe_input() as shell_input:
+                with create_app_session(input=shell_input, output=DummyOutput()):
+                    premium_shell = ShadowLinkConsole()
+                    with patch.object(premium_shell, "print_welcome"), \
+                            patch.object(premium_shell, "_prompt_text",
+                                         wraps=premium_shell._prompt_text) as prompt_renderer, \
+                            patch.object(premium_shell, "_bottom_toolbar_text",
+                                         wraps=premium_shell._bottom_toolbar_text) as toolbar_renderer:
+                        shell_input.send_text("/exit\r\r")
+                        premium_shell.run()
+            check("Premium animated prompt and toolbar render in the live shell",
+                  prompt_renderer.call_count > 0 and toolbar_renderer.call_count > 0)
+            with patch("shadow_link.tui._print_formatted_text") as help_renderer:
+                console.cmd_help()
+            help_text = "".join(
+                fragment[1] for fragment in to_formatted_text(help_renderer.call_args.args[0])
+            )
+            check("Help screen uses premium grouped information hierarchy",
+                  all(section in help_text for section in
+                      ("CORE MEMORY", "LIVE MIRROR", "FEEDBACK LOOP", "SYSTEM")))
+
+            shadow_view = WatchView(console)
+            splash_text = "".join(fragment[1] for fragment in shadow_view._splash_text())
+            check("Claude Shadow opens on a Braille image splash",
+                  shadow_view.splash_mode and "⣿" in splash_text and "CLAUDE SHADOW" not in splash_text)
+            check("Claude Shadow splash prompts for Enter",
+                  "PRESS ENTER TO CONTINUE" in splash_text)
+            shadow_view._splash_frame += 1
+            animated_splash = "".join(
+                fragment[1] for fragment in shadow_view._splash_text()
+            )
+            check("Claude Shadow splash animates its Braille spinner",
+                  animated_splash != splash_text and "⠙" in animated_splash)
+            with patch("shadow_link.tui.get_app") as current_app:
+                current_app.return_value.output.get_size.return_value.rows = 24
+                compact_splash = "".join(
+                    fragment[1] for fragment in shadow_view._splash_text()
+                )
+            check("Claude Shadow uses a compact raster on short terminals",
+                  len(compact_splash.splitlines()) <= 23 and "⣿" in compact_splash)
+            with patch.object(shadow_view, "_open_session_picker") as open_picker:
+                shadow_view._continue_from_splash()
+            check("Enter transition opens the session picker",
+                  not shadow_view.splash_mode and open_picker.call_count == 1)
+            shadow_view.ghost = {
+                "id": 1, "text": "sample ghost", "confidence": 0.7,
+                "bucket": "correction", "source": "test", "tier": "high",
+            }
+            ghost_text = "".join(
+                fragment[1] for fragment in to_formatted_text(shadow_view._ghost_text())
+            )
+            check("Ghost panel renders a premium confidence meter",
+                  "███████░░░" in ghost_text and "0.70" in ghost_text)
+
+            with create_pipe_input() as pipe_input:
+                with create_app_session(input=pipe_input, output=DummyOutput()):
+                    keyed_view = WatchView(console)
+                    with patch.object(keyed_view, "_fetch_daemon_state", return_value=None), \
+                            patch.object(keyed_view, "_open_session_picker") as keyed_picker:
+                        def feed_keys():
+                            pipe_input.send_text("\r")
+                            time.sleep(0.35)
+                            pipe_input.send_text("\x03")
+                        feeder = threading.Thread(target=feed_keys, daemon=True)
+                        feeder.start()
+                        keyed_view.run()
+                        feeder.join(timeout=1.0)
+            check("Full-screen Enter key binding reaches the session picker",
+                  keyed_picker.call_count == 1 and not keyed_view.splash_mode)
+            check("UI animation thread stops after leaving the view",
+                  keyed_view._animation_thread is not None and
+                  not keyed_view._animation_thread.is_alive())
+            check("Premium motion continues across the session workspace",
+                  keyed_view._splash_frame > 0)
+            check("Console connects to daemon API", console.check_daemon(force=True))
+
+            proxy = console._request_json("GET", "/proxy/status")
+            check("TUI reads Claude Code proxy state from daemon",
+                  {"running", "managed", "port", "available", "proxy_url"}.issubset(proxy))
+            check("Proxy manager finds user-installed mitmdump", proxy.get("available"))
+            audit = console._request_json("GET", "/proxy/audit?limit=5")
+            check("TUI reads recent proxy traffic from daemon",
+                  len(audit.get("events", [])) == 1 and audit["events"][0]["phase"] == "request")
+            console._proxy_view(5)
+            check("TUI renders proxy traffic view", True)
+
+            original_db_path = console.config.db_path
+            console.config.db_path = test_audit_dir / "shadow_link.db"
+            launcher = console._write_proxy_launcher(8080)
+            launcher_text = launcher.read_text(encoding="utf-8")
+            check("Proxy setup generates scoped Claude PowerShell launcher",
+                  "HTTPS_PROXY" in launcher_text and "& claude @ClaudeArgs" in launcher_text)
+            launcher.unlink()
+            console.config.db_path = original_db_path
+
+            with patch.object(console, "_remote", side_effect=DaemonAPIError("Endpoint not found")):
+                legacy_proxy, legacy_source = console._proxy_action("status", 8080)
+            check("TUI falls back when connected daemon predates proxy API",
+                  legacy_source == "TUI process" and "running" in legacy_proxy)
+
+            learned = console._request_json("POST", "/ingest", {
+                "question": "I will wrap the entire upload function in try/except.",
+                "response": "That's wrong; only guard the network call.",
+                "request_id": "tui-test",
+            })
+            check("TUI daemon ingest stores a reaction pair", isinstance(learned.get("prompt_id"), int))
+
+            prediction = console._request_json("POST", "/predict", {
+                "question": "I will wrap the entire upload function in try/except.",
+            })
+            ghost = prediction.get("ghost") or {}
+            check("TUI daemon prediction uses situation context", "network call" in ghost.get("text", ""))
+
+            feedback = console._request_json("POST", "/feedback", {
+                "id": ghost.get("id"), "vote": "up", "text": "",
+                "situation": "I will wrap the entire upload function in try/except.",
+            })
+            check("TUI feedback closes reinforcement loop", feedback.get("new_weight", 0) > 1.0)
+
+            stats = console._request_json("GET", "/stats")
+            check("Daemon stats expose prompts and graph edges",
+                  stats.get("total_prompts") == 1 and "total_edges" in stats)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if test_db.exists():
+            test_db.unlink()
+        for path in test_audit_dir.glob("*"):
+            path.unlink()
+        test_audit_dir.rmdir()
+
+
+
+def main():
+    test_engine()
+    asyncio.run(test_mcp())
+    test_hook()
+    asyncio.run(test_prompt_wrapper())
+    test_proxy_optimizer()
+    test_tui_initialization()
+    print("\n" + "=" * 40)
+    failed = [n for n, s in results if s == FAIL]
+    print(f"{len(results) - len(failed)}/{len(results)} checks passed")
+    if failed:
+        print("FAILED:", ", ".join(failed))
+        sys.exit(1)
+    print("ALL GREEN")
+
+if __name__ == "__main__":
+    main()

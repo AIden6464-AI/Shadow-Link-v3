@@ -1,0 +1,56 @@
+{
+  "_comment": "Shadow Link v3 sample configuration. Copy to config.json and edit. Real env vars override config.json values; config.json overrides hardcoded defaults. Code defaults stay at localhost — set Tailscale/remote URLs here if your LM Studio runs elsewhere.",
+
+  "database": {
+    "path": "shadow_link.db"
+  },
+
+  "embeddings": {
+    "server_url": "http://localhost:1235/v1/embeddings",
+    "model": "",
+    "provider": "lmstudio",
+    "timeout_seconds": 5.0,
+    "use_on_hot_path": false
+  },
+
+  "chat": {
+    "_comment": "Local LLM that synthesizes the operator's likely reply in their voice. Point at LM Studio / llama.cpp / Ollama with an OpenAI-compatible /v1/chat/completions endpoint. If 'model' is left as 'local-model' the auto-resolver picks the best loaded model (prefers coder / qwopus / qwen / 27b / 32b / 70b / instruct).",
+    "server_url": "http://localhost:1234/v1/chat/completions",
+    "model": "local-model",
+    "timeout_seconds": 25,
+    "lm_mode": true,
+    "max_tokens": 96,
+    "examples": 8,
+    "situation_chars": 600,
+    "reply_chars": 500
+  },
+
+  "matching": {
+    "alpha_base": 0.4,
+    "global_threshold": 0.6,
+    "ghost_min_signal": 0.1,
+    "thresholds": {
+      "rejection": 0.75,
+      "correction": 0.75,
+      "reminder": 0.55,
+      "request": 0.55,
+      "pivot": 0.45
+    }
+  },
+
+  "server": {
+    "host": "localhost",
+    "port": 5000
+  },
+
+  "proxy": {
+    "_comment": "When inject_synthesized=true the proxy asks the daemon to run the local LLM and injects the synthesized ghost as the operator's likely reply, with retrieved snippets following as grounding evidence. nudge_budget_seconds caps the LLM wall-clock per request; nudge_timeout_seconds is the proxy->daemon HTTP timeout (must be > budget).",
+    "daemon_url": "http://localhost:5000",
+    "port": 8080,
+    "inject_nudges": true,
+    "inject_synthesized": true,
+    "nudge_budget_seconds": 4.0,
+    "nudge_timeout_seconds": 5.0,
+    "learn": true
+  }
+}

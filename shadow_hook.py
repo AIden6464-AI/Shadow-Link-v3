@@ -1,0 +1,142 @@
+"""
+Shadow Link — Claude Code UserPromptSubmit hook for v3.
+
+Captures reaction pairs and predictive context dynamically.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+# Add local path to sys.path so we can import shadow_link natively
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+os.environ.setdefault("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+def _fail_safe():
+    sys.exit(0)
+
+def _last_assistant_text(transcript_path: str) -> str:
+    """Pull the most recent assistant message text from the JSONL transcript."""
+    try:
+        p = Path(transcript_path)
+        if not p.exists():
+            return ""
+        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = evt.get("message") or {}
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            text = "\n".join(p for p in parts if p).strip()
+            if text:
+                return text
+    return ""
+
+def main() -> None:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        _fail_safe()
+
+    prompt = (data.get("prompt") or "").strip()
+    transcript_path = data.get("transcript_path", "")
+
+    # Skip trivia and slash commands
+    if len(prompt) < 4 or prompt.startswith("/"):
+        _fail_safe()
+
+    try:
+        from shadow_link.config import Config
+        from shadow_link.database import Database
+        from shadow_link.engine import Engine
+        from shadow_link.ingester import classify_multi
+    except Exception:
+        _fail_safe()
+
+    try:
+        cfg = Config()
+        db = Database(cfg.db_path)
+        engine = Engine(db)
+    except Exception:
+        _fail_safe()
+
+    agent_output = _last_assistant_text(transcript_path)
+
+    # 1. PREDICT (before capture)
+    nudge_block = ""
+    try:
+        query = f"{agent_output}\n{prompt}" if agent_output else prompt
+        results = engine.match(
+            query, top_k=2, threshold=0.0,
+            buckets=["rejection", "correction", "reminder", "pivot"],
+        )
+        lines_out = []
+        for r in results:
+            signal = r.combined_score * max(0.0, min(r.effective_weight, 2.0))
+            tier = "high" if signal >= 0.55 else "medium" if signal >= 0.30 else "low"
+            if tier == "low":
+                continue
+            lines_out.append(f"- ({tier}, {r.bucket}) {r.text}")
+        if lines_out:
+            nudge_block = (
+                "Shadow Link — based on past reactions, the operator tends to say:\n"
+                + "\n".join(lines_out)
+            )
+    except Exception:
+        nudge_block = ""
+
+    # 2. CAPTURE the reaction pair
+    try:
+        buckets = classify_multi(prompt)
+        meta = {"buckets": buckets, "source": "hook", "session": data.get("session_id", "")}
+        if agent_output:
+            meta["agent_output"] = agent_output[:1000]
+        db.add_prompt(text=prompt, bucket=buckets[0], metadata=meta)
+    except Exception:
+        pass
+
+    # 3. CHECK for shadow-link TUI/CLI inject
+    inject_file = Path.home() / ".claude" / "shadow_pending.txt"
+    inject_text = ""
+    try:
+        if inject_file.exists():
+            inject_text = inject_file.read_text(encoding="utf-8").strip()
+            inject_file.unlink()
+    except Exception:
+        inject_text = ""
+
+    output = inject_text or nudge_block
+    if output:
+        print(output)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        _fail_safe()
