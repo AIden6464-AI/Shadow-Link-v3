@@ -365,7 +365,11 @@ def compete(
     for c in cands:
         if top > 0 and c.score < top * OUTCOMPETED_RATIO:
             c.suppressors.append("outcompeted")
-        nterms = store._terms_cache.get(c.id) or set()
+        # Duplicates are judged on what a node says, not on the situation terms a
+        # reaction is indexed under: two different replies to one situation are
+        # not the same memory.
+        nterms = terms(c.node["content"]) if c.node["type"] == "reaction" else (
+            store._terms_cache.get(c.id) or set())
         if nterms:
             for kid, kt in kept_terms:
                 if term_overlap(nterms, kt) >= DUPLICATE_OVERLAP:
@@ -417,6 +421,8 @@ def _pull_item(store: CognitiveStore, c: Candidate, nodes_by_id: dict[str, dict]
             "selected_because": reason or "top score after competition",
         },
         "conflicts": sorted(c.act.conflicts),
+        # For a reaction: what Claude said that the user was replying to.
+        "situation": (n.get("metadata") or {}).get("situation", "") if n["type"] == "reaction" else "",
         "provenance": provenance(store, c.id),
         "_path_ids": path_ids,
     }

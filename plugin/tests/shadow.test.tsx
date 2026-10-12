@@ -44,7 +44,7 @@ function fakes(on: On, opts: { isDown?: boolean } = {}): Calls {
             ],
           }
         : path === '/aca/event'
-          ? { context: [{ title: 'you rejected Docker for dev', type: 'reaction', content: 'use the venv', why: { seed_reason: 'lexical match 0.55' } }] }
+          ? { context: [{ title: 'you rejected Docker for dev', type: 'reaction', content: 'use the venv', situation: SITUATION, why: { seed_reason: 'lexical match 0.55' } }] }
           : {}
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(reply) } }
   })
@@ -155,6 +155,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(calls.forks.length).toBe(1)
     expect(calls.forks[0]).toContain('did I ever decide on postgres?')
     expect(calls.forks[0]).toContain('use the venv') // recalled from Shadow Link's memory
+    expect(calls.forks[0]).toContain(`When Claude said "${SITUATION}"`) // with the situation it answered
     expect(await ui.find({ type: 'Text', text: /docker compose for the database only/ })).toBeDefined()
     await ui.press({ key: 'send-answer' })
     expect(calls.filled).toEqual(['Yes: docker compose for the database only.'])

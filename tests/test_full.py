@@ -796,6 +796,13 @@ def test_aca():
     out_db = aca_db.process("I'll create a Docker container for development", task_id="D1")
     check("reaction corpus is mirrored and a rejection activates despite its negation",
           any(i["id"] == "P-1" for i in out_db["context"]))
+    db.add_prompt("use podman instead", "pivot",
+                  metadata={"agent_output": "I will set up a Docker container for the dev environment"})
+    out_two = open_aca(test_db).process("I'll set up a Docker container for the dev environment", task_id="D1b")
+    two = {i["id"] for i in out_two["context"] if i["type"] == "reaction"}
+    check("two different replies to the same situation are not treated as duplicates", {"P-1", "P-2"} <= two)
+    check("reaction context items carry the situation they answered",
+          all(i["situation"] for i in out_two["context"] if i["type"] == "reaction"))
 
     # bug fixes: orphans after clear, prompt memory opt-in, read-only reads, event pruning
     db.clear()
