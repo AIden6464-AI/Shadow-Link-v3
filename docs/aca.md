@@ -131,9 +131,15 @@ co-useful nodes with `co_active`, and inhibits useless nodes for the rest
 of the task.
 
 **Memory formation.** The `remember` Score neuron decides store, temporary
-or discard. Plain prompts are kept only on `store`. Temporary memories that
-are never used are pruned after 48 h. New memories are wired to whatever
-was co-active with them.
+or discard for observations, errors, tool results and findings. Plain
+prompts are never stored unless the caller passes `remember=True`, so the
+graph does not fill with your own questions; `remember=False` stores
+nothing. Temporary memories that are never used are pruned after 48 h. New
+memories are wired to whatever was co-active with them.
+
+**Corpus mirror.** Each event first syncs the reply corpus: new replies are
+added, and replies deleted from the corpus (or wiped by `shadow-link clear`)
+are removed from the graph with their links.
 
 **Episodes → semantic / procedural memory.** `close_task` stores an
 episode linked to the context and hypotheses that mattered. It
@@ -148,14 +154,16 @@ across tasks, and that average biases where spreading goes.
 judgment, inhibition, expansion, contradiction, hypothesis update, memory
 decision, feedback and agent wake-up is written to `aca_events`.
 `inspect(task, node)` answers "why is this active?". `snapshot(task)`
-returns the Working Brain panel.
+returns the Working Brain panel. Both are read-only. Events older than 30
+days are pruned, at most once an hour.
 
 ## Jev
 
 `JevBackend(client)` sends the state and the question list
 (`Question.to_dict()`) to a client function you provide. It fans batches
-out in parallel. Any question the client doesn't answer falls back to the
-heuristic backend. The TypeSafe wire format is **not hard-coded**: the
+out in parallel. Any question the client doesn't answer, answers with a
+malformed result, or fails on (an exception) falls back to the heuristic
+backend, and the problem is logged. The TypeSafe wire format is **not hard-coded**: the
 official API reference (docs.typesafe.ai) couldn't be reached while this
 was written. Wrap the official SDK or API in a function that returns
 `{name: {"noul": p} | {"choice": {opt: p}} | {"score": v, "levels": {...}}}`

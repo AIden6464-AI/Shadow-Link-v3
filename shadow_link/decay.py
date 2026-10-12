@@ -13,15 +13,19 @@ from enum import Enum
 
 class DecayClass(str, Enum):
     PERMANENT = "permanent"   # Architecture/style rules — λ → 0
-    TACTICAL = "tactical"     # Local env fixes — t_half = 12h
-    EPHEMERAL = "ephemeral"   # Session-scoped rejections — t_half = 1.5h
+    TACTICAL = "tactical"     # Requests / pivots — t_half = 7 days
+    EPHEMERAL = "ephemeral"   # Rejections / corrections — t_half = 3 days
 
-# Half-life in hours for each class.
+# Half-life in hours for each class (env-overridable).
 _HALF_LIVES: dict[DecayClass, float] = {
     DecayClass.PERMANENT: math.inf,
-    DecayClass.TACTICAL: 12.0,
-    DecayClass.EPHEMERAL: 1.5,
+    DecayClass.TACTICAL: float(os.getenv("SHADOW_HALF_LIFE_TACTICAL_HOURS", str(24 * 7))),
+    DecayClass.EPHEMERAL: float(os.getenv("SHADOW_HALF_LIFE_EPHEMERAL_HOURS", str(24 * 3))),
 }
+
+# Decay never takes a reply below this fraction of its base weight, so an old
+# correction stays findable; feedback (reject) is what removes a reply.
+WEIGHT_FLOOR_FRACTION: float = float(os.getenv("SHADOW_WEIGHT_FLOOR", "0.25"))
 
 # Map bucket names → decay class.
 BUCKET_DECAY_CLASS: dict[str, DecayClass] = {
@@ -55,7 +59,7 @@ def effective_weight(
     ref = last_triggered_at if last_triggered_at is not None else time.time()
     now = now or time.time()
     delta_hours = max(0.0, (now - ref) / 3600.0)
-    return w_base * math.exp(-lam * delta_hours)
+    return w_base * max(WEIGHT_FLOOR_FRACTION, math.exp(-lam * delta_hours))
 
 def effective_weight_for_row(row: dict, now: float | None = None) -> float:
     """

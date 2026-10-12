@@ -24,10 +24,13 @@ actions need much stronger evidence.
 
 from __future__ import annotations
 
+import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
+
+logger = logging.getLogger("shadow_link.aca.neurons")
 
 
 # ------------------------------------------------------------ question types
@@ -335,32 +338,48 @@ class JevBackend:
             futs = [pool.submit(self.client, state, [q.to_dict() for q in b]) for b in batches]
             for fut in futs:
                 try:
-                    results.update(fut.result() or {})
-                except Exception:
-                    pass
+                    res = fut.result()
+                    if isinstance(res, dict):
+                        results.update(res)
+                    else:
+                        logger.warning("Jev client returned %s, expected dict", type(res).__name__)
+                except Exception as exc:
+                    logger.warning("Jev client call failed: %s", exc)
         out: list[Signal] = []
         missing: list[Question] = []
         for q in questions:
-            r = results.get(q.name)
-            if r is None:
+            sig = self._parse(q, results.get(q.name))
+            if sig is None:
                 missing.append(q)
-                continue
-            if q.kind == "noul":
-                out.append(Signal(q.name, "noul", float(r["noul"]), backend=self.name,
-                                  targets=[q.name.split(":", 1)[1]] if ":" in q.name else []))
-            elif q.kind == "choice":
-                probs = {k: float(v) for k, v in r["choice"].items()}
-                top = max(probs, key=probs.get)
-                out.append(Signal(q.name, "choice", probs[top], top=top, probs=probs,
-                                  backend=self.name))
             else:
-                lv = {k: float(v) for k, v in (r.get("levels") or {}).items()}
-                out.append(Signal(q.name, "score", float(r["score"]),
-                                  top=max(lv, key=lv.get) if lv else "", probs=lv,
-                                  backend=self.name))
+                out.append(sig)
         if missing:
             out.extend(self.fallback.evaluate(state, missing))
         return out
+
+    def _parse(self, q: Question, r) -> Signal | None:
+        """A typed Signal from one Jev result, or None if it is missing or malformed."""
+        if not isinstance(r, dict):
+            return None
+        try:
+            if q.kind == "noul":
+                p = float(r["noul"])
+                if not 0.0 <= p <= 1.0:
+                    raise ValueError(f"noul {p} outside [0, 1]")
+                return Signal(q.name, "noul", p, backend=self.name,
+                              targets=[q.name.split(":", 1)[1]] if ":" in q.name else [])
+            if q.kind == "choice":
+                probs = {str(k): float(v) for k, v in dict(r["choice"]).items()}
+                if not probs:
+                    raise ValueError("empty choice")
+                top = max(probs, key=probs.get)
+                return Signal(q.name, "choice", probs[top], top=top, probs=probs, backend=self.name)
+            lv = {str(k): float(v) for k, v in dict(r.get("levels") or {}).items()}
+            return Signal(q.name, "score", float(r["score"]),
+                          top=max(lv, key=lv.get) if lv else "", probs=lv, backend=self.name)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("Malformed Jev result for %s (%s); using fallback", q.name, exc)
+            return None
 
 
 # ----------------------------------------------------------- firing policy

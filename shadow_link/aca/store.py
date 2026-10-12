@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS aca_events (
     detail   TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_aca_events_task ON aca_events(task_id, seq);
+CREATE INDEX IF NOT EXISTS idx_aca_events_ts ON aca_events(ts);
 CREATE TABLE IF NOT EXISTS aca_tasks (
     id         TEXT PRIMARY KEY,
     goal       TEXT NOT NULL DEFAULT '',
@@ -336,12 +337,24 @@ class CognitiveStore:
     def prune_temporary(self, max_age_hours: float = 48.0) -> int:
         """Forget temporary memories that were never used again."""
         cutoff = time.time() - max_age_hours * 3600
+        return self._delete_nodes(self._ids_where(
+            "status='temporary' AND use_count=0 AND created_at < ?", (cutoff,)))
+
+    def prune_events(self, max_age_days: float = 30.0) -> int:
+        """Drop replay events older than `max_age_days`."""
+        cutoff = time.time() - max_age_days * 86400
         with self._conn() as c:
-            ids = [r["id"] for r in c.execute(
-                "SELECT id FROM aca_nodes WHERE status='temporary' AND use_count=0 AND created_at < ?",
-                (cutoff,))]
-            for i in range(0, len(ids), 500):
-                chunk = ids[i:i + 500]
+            return c.execute("DELETE FROM aca_events WHERE ts < ?", (cutoff,)).rowcount
+
+    def _ids_where(self, where: str, params: tuple = ()) -> list[str]:
+        with self._conn() as c:
+            return [r["id"] for r in c.execute(f"SELECT id FROM aca_nodes WHERE {where}", params)]
+
+    def _delete_nodes(self, ids: list[str]) -> int:
+        """Delete nodes and every synapse touching them."""
+        with self._conn() as c:
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
                 q = ",".join("?" * len(chunk))
                 c.execute(f"DELETE FROM aca_synapses WHERE src IN ({q}) OR dst IN ({q})", chunk + chunk)
                 c.execute(f"DELETE FROM aca_nodes WHERE id IN ({q})", chunk)
@@ -520,6 +533,17 @@ class CognitiveStore:
         if not has:
             return 0
         cursor = int(self.get_meta("synced_prompt_id", 0))
+        with self._conn() as c:
+            max_prompt = c.execute("SELECT COALESCE(MAX(id), 0) FROM prompts").fetchone()[0]
+        if max_prompt < cursor:
+            # The corpus was cleared and ids restarted: every mirrored reply is stale.
+            self._delete_nodes(self._ids_where("id LIKE 'P-%'"))
+            cursor = 0
+            self.set_meta("synced_prompt_id", 0)
+        else:
+            # Replies deleted from the corpus must not keep activating.
+            self._delete_nodes(self._ids_where(
+                "id LIKE 'P-%' AND CAST(substr(id, 3) AS INTEGER) NOT IN (SELECT id FROM prompts)"))
         with self._conn() as c:
             rows = c.execute("SELECT * FROM prompts WHERE id > ? ORDER BY id", (cursor,)).fetchall()
         added = 0

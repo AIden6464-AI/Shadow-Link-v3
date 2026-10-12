@@ -57,6 +57,10 @@ def build_prediction(db_path: str, claude_output: str, top_k: int = 4,
     retrieved_ghost = pack(results[0])
     alternates = [pack(r) for r in results[1:]]
     grounding_ids = [r.prompt_id for r in results]
+    # Surfacing a reply as the ghost is a use: re-arm its decay clock so replies
+    # that keep applying stay strong instead of fading on wall-clock time alone.
+    # Alternates are not re-armed, so weak runners-up still fade.
+    db.update_triggered(results[0].prompt_id)
 
     from shadow_link import generate as gen
     if gen.lm_enabled():

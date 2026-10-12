@@ -643,6 +643,50 @@ def test_aca():
     check("reaction corpus is mirrored and a rejection activates despite its negation",
           any(i["id"] == "P-1" for i in out_db["context"]))
 
+    # bug fixes: orphans after clear, prompt memory opt-in, read-only reads, event pruning
+    db.clear()
+    out_cleared = open_aca(test_db).process("I'll create a Docker container for development", task_id="D2")
+    check("cleared corpus replies no longer activate",
+          not any(i["id"].startswith("P-") for i in out_cleared["context"]))
+    check("orphaned reply nodes are deleted", aca_db.store.get_node("P-1") is None)
+    db.add_prompt("use podman, not docker", "rejection",
+                  metadata={"agent_output": "I'll create a Docker container for development"})
+    out_new = open_aca(test_db).process("I'll create a Docker container for development", task_id="D3")
+    check("replies added after a clear are mirrored again",
+          any(i["type"] == "reaction" and "podman" in i["content"] for i in out_new["context"]))
+
+    long_prompt = ("We need to migrate the billing service from the legacy payments gateway to the new "
+                   "provider while keeping invoices, refunds, webhooks and reconciliation working")
+    s2, aca2, _ = _auth_graph()
+    check("plain prompts are not stored as memory by default",
+          aca2.process(long_prompt, task_id="M1")["memory"] is None)
+    check("prompts are stored when explicitly asked",
+          aca2.process(long_prompt, task_id="M1", remember=True)["memory"] is not None)
+    before = len(s2.replay("never-opened"))
+    aca2.snapshot("never-opened")
+    check("reading a task's brain writes nothing", len(s2.replay("never-opened")) == before
+          and s2.load_task("never-opened") is None)
+    s2.log("old", task_id="M1")
+    with s2._conn() as c:
+        c.execute("UPDATE aca_events SET ts = ts - 90 * 86400 WHERE kind = 'old'")
+    check("old replay events are pruned", s2.prune_events(30) >= 1
+          and not any(e["kind"] == "old" for e in s2.replay("M1")))
+
+    bad_shapes = [{"noul": "not-a-number"}, {"noul": 3.0}, {"choice": {}}, "garbage"]
+    for bad in bad_shapes:
+        aca_bad = ACA(s2, backend=JevBackend(lambda st, qs, b=bad: {q["name"]: b for q in qs}))
+        try:
+            res = aca_bad.process("why did auth break", task_id="J1", remember=False)
+            ok = all(x["backend"] == "heuristic" for x in res["signals"])
+        except Exception:
+            ok = False
+        check(f"malformed Jev result {bad!r} falls back instead of crashing", ok)
+
+    def boom(state, questions):
+        raise RuntimeError("network down")
+    res = ACA(s2, backend=JevBackend(boom)).process("why did auth break", task_id="J2", remember=False)
+    check("a failing Jev client falls back to heuristics", len(res["signals"]) > 0)
+
     # HTTP API
     import threading
     import urllib.request
@@ -675,6 +719,56 @@ def test_aca():
                 p.unlink()
 
 
+def test_ghost_fixes():
+    print("\nH. GHOST DECAY + CLASSIFICATION")
+    from shadow_link.database import Database
+    from shadow_link.decay import effective_weight_for_row, WEIGHT_FLOOR_FRACTION
+    from shadow_link.ingester import classify_multi
+    from shadow_link.live import build_prediction
+
+    check("explicit negation is classified as a rejection",
+          classify_multi("do not use docker for local dev")[0] == "rejection")
+    check("'never' is a rejection signal", "rejection" in classify_multi("never mock the database"))
+    check("'wrong' alone is not also a correction", "correction" not in classify_multi("that's wrong"))
+
+    now = time.time()
+    day_old = effective_weight_for_row({"bucket": "rejection", "weight": 1.0, "created_at": now - 86400}, now)
+    check("a day-old rejection keeps most of its weight (3-day half-life)", day_old > 0.75)
+    month_old = effective_weight_for_row({"bucket": "rejection", "weight": 1.0, "created_at": now - 30 * 86400}, now)
+    check("decay never drops below the weight floor", abs(month_old - WEIGHT_FLOOR_FRACTION) < 1e-9)
+
+    test_db = ROOT / "_test_v3_ghost.db"
+    for suffix in ("", "-wal", "-shm"):
+        pth = Path(str(test_db) + suffix)
+        if pth.exists():
+            pth.unlink()
+    old_lm = os.environ.get("SHADOW_LM_MODE")
+    os.environ["SHADOW_LM_MODE"] = "0"
+    try:
+        import importlib
+        import shadow_link.generate as gen
+        importlib.reload(gen)
+        db = Database(test_db)
+        pid = db.add_prompt("that's wrong, don't use docker, use the venv", "rejection",
+                            metadata={"agent_output": "I will set up a Docker container for the dev environment"})
+        with db._connection() as conn:
+            conn.execute("UPDATE prompts SET created_at = created_at - 86400")
+        ghost, _ = build_prediction(str(test_db), "I'll set up a Docker container for the dev environment")
+        check("a 24-hour-old rejection still produces a ghost", bool(ghost) and ghost["id"] == pid)
+        check("surfacing a ghost re-arms its decay clock",
+              (db.get_prompt(pid)["triggered_at"] or 0) > time.time() - 60)
+    finally:
+        if old_lm is None:
+            os.environ.pop("SHADOW_LM_MODE", None)
+        else:
+            os.environ["SHADOW_LM_MODE"] = old_lm
+        importlib.reload(gen)
+        for suffix in ("", "-wal", "-shm"):
+            pth = Path(str(test_db) + suffix)
+            if pth.exists():
+                pth.unlink()
+
+
 def main():
     test_engine()
     asyncio.run(test_mcp())
@@ -683,6 +777,7 @@ def main():
     test_proxy_optimizer()
     test_tui_initialization()
     test_aca()
+    test_ghost_fixes()
     print("\n" + "=" * 40)
     failed = [n for n, s in results if s == FAIL]
     print(f"{len(results) - len(failed)}/{len(results)} checks passed")

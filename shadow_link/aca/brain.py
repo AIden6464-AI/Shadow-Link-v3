@@ -125,11 +125,19 @@ class ACA:
             if goal and not wb.goal:
                 wb.goal = goal
             return wb
-        wb = WorkingBrain(task_id=task_id, goal=goal)
-        self.store.log("task_opened", task_id=task_id, goal=goal)
+        return WorkingBrain(task_id=task_id, goal=goal)
+
+    def _open(self, task_id: str, goal: str = "") -> WorkingBrain:
+        """Load or create a task for writing; a new task is persisted (and logged) at once."""
+        wb = self.brain(task_id, goal)
+        if self.store.load_task(task_id) is None:
+            self._save(wb)
         return wb
 
     def _save(self, wb: WorkingBrain, closed: bool = False) -> None:
+        # A task is "opened" when first written, so reads never create log entries.
+        if self.store.load_task(wb.task_id) is None:
+            self.store.log("task_opened", task_id=wb.task_id, goal=wb.goal)
         self.store.save_task(wb.task_id, wb.goal, wb.to_dict(), closed)
 
     def agents(self) -> list[dict]:
@@ -159,10 +167,14 @@ class ACA:
         refs: list[str] | None = None,
         project: str = "",
         budget: Budget | None = None,
-        remember: bool = True,
+        remember: bool | None = None,
     ) -> dict:
         """
         Handle one event: activate, converge, judge, propagate — recurrently.
+
+        `remember`: True stores the event, False never does, None lets the
+        `remember` neuron decide — except plain prompts, which are only stored
+        when explicitly asked, so the graph does not fill with your own questions.
         Returns the converged context, the Jev state, the signals, the funnel
         and the actions the caller should take (agents to wake, verification).
         """
@@ -172,12 +184,15 @@ class ACA:
 
     def _process(self, text: str, *, kind: str, task_id: str | None, goal: str,
                  refs: list[str] | None, project: str, budget: Budget | None,
-                 remember: bool) -> dict:
+                 remember: bool | None) -> dict:
         t0 = time.time()
         self.store.sync_from_prompts()
         self.store.prune_temporary()
+        if t0 - float(self.store.get_meta("events_pruned_at", 0)) > 3600:
+            self.store.prune_events()
+            self.store.set_meta("events_pruned_at", t0)
         task_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
-        wb = self.brain(task_id, goal or text[:120])
+        wb = self._open(task_id, goal or text[:120])
         budget = budget or self.budget
         event = {"kind": kind, "text": text, "refs": refs or [], "project": project}
         self.store.log("event", task_id=task_id, cycle=wb.cycle, kind_=kind, text=text[:500])
@@ -303,8 +318,9 @@ class ACA:
 
         memory_id = None
         rem = sig.get("remember")
-        if remember and rem:
-            memory_id = self._form_memory(text, kind, rem, result["items"], project, task_id, wb)
+        if rem and remember is not False and (kind != "prompt" or remember is True):
+            memory_id = self._form_memory(text, kind, rem, result["items"], project, task_id, wb,
+                                          forced=remember is True)
 
         self._update_attention({i["id"]: i["activation"] for i in result["items"]})
         self._save(wb)
@@ -324,16 +340,13 @@ class ACA:
 
     # ----------------------------------------------------- memory formation
     def _form_memory(self, text: str, kind: str, rem: Signal, items: list[dict],
-                     project: str, task_id: str, wb: WorkingBrain) -> str | None:
-        decision = rem.top or ("store" if rem.value >= 0.66 else
-                               "temporary" if rem.value >= 0.33 else "discard")
+                     project: str, task_id: str, wb: WorkingBrain,
+                     forced: bool = False) -> str | None:
+        decision = "store" if forced else rem.top or (
+            "store" if rem.value >= 0.66 else "temporary" if rem.value >= 0.33 else "discard")
         self.store.log("memory_decision", task_id=task_id, cycle=wb.cycle, value=rem.value,
                        decision=decision)
         if decision == "discard" or not text.strip():
-            return None
-        # Plain prompts are only kept when clearly worth it; observations,
-        # errors and tool results may live temporarily in case they matter.
-        if kind == "prompt" and decision != "store":
             return None
         ntype = EVENT_TYPES.get(kind, "observation")
         nid = self.store.add_node(
@@ -378,7 +391,7 @@ class ACA:
     # ---------------------------------------------------------- hypotheses
     def add_hypothesis(self, task_id: str, text: str, prior: float = 0.5,
                        about: list[str] | None = None) -> str:
-        wb = self.brain(task_id)
+        wb = self._open(task_id)
         hid = self.store.add_node(text, type="hypothesis", title=text[:80], trust=prior,
                                   importance=prior, metadata={"task_id": task_id,
                                                               "confidence": prior})
@@ -442,7 +455,7 @@ class ACA:
         the path that activated it, record usefulness on the node, and connect
         co-useful nodes so they activate together next time.
         """
-        wb = self.brain(task_id)
+        wb = self._open(task_id)
         path = wb.pulled_ever.get(node_id, [node_id])
         self.store.mark_usefulness(node_id, useful)
         changed = []
@@ -472,7 +485,7 @@ class ACA:
 
     def report_action(self, task_id: str, action: str, success: bool, detail: str = "") -> None:
         """Outcome of an action taken outside ACA — feeds the metacognitive layer."""
-        wb = self.brain(task_id)
+        wb = self._open(task_id)
         wb.actions.append({"action": action, "success": success, "detail": detail[:300],
                            "ts": time.time()})
         self.store.log("action", task_id=task_id, value=1.0 if success else 0.0,
@@ -486,7 +499,7 @@ class ACA:
         Store the task as an episode linked to everything that mattered, then
         consolidate its lesson into semantic memory (and optionally a procedure).
         """
-        wb = self.brain(task_id)
+        wb = self._open(task_id)
         hyps = self._hypotheses(wb)
         useful = [a["useful_node"] for a in wb.actions if a.get("useful_node")]
         involved = list(dict.fromkeys(useful + list(wb.pulled_ever)))[:40]

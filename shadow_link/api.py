@@ -815,7 +815,7 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                 out = aca.process(
                     data["text"], kind=data.get("kind", "prompt"), task_id=data.get("task_id"),
                     goal=data.get("goal", ""), refs=data.get("refs"), project=data.get("project", ""),
-                    remember=bool(data.get("remember", True)),
+                    remember=data.get("remember"),
                 )
             elif route == "node":
                 out = {"id": aca.store.add_node(

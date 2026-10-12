@@ -27,7 +27,7 @@ KEYWORDS_REMINDER = {
 }
 
 KEYWORDS_CORRECTION = {
-    "missed", "error", "bug", "broken", "endpoint", "mistake", "wrong", 
+    "missed", "error", "bug", "broken", "endpoint", "mistake", 
     "adjust", "gpu", "fail", "allocation", "fix", "incorrect", "correction",
     "missing", "not working", "fails to"
 }
@@ -36,6 +36,12 @@ KEYWORDS_PIVOT = {
     "instead", "pivot", "change direction", "rebrand", "reframe", 
     "new approach", "move to", "switch", "alternative", "rethink"
 }
+
+# Explicit negation in a reply ("do not use docker", "never mock the db") is a
+# rejection of what the agent proposed, whatever other keywords it contains.
+_NEGATION_RE = re.compile(
+    r"\b(?:do not|don't|dont|does not|doesn't|never|avoid|stop using|no need)\b")
+
 
 def classify_by_heuristics(text: str) -> str:
     """Helper to classify text into a single primary bucket based on keywords."""
@@ -47,7 +53,7 @@ def classify_multi(text: str) -> list[str]:
     """
     text_lower = text.lower()
     hits: list[str] = []
-    if any(kw in text_lower for kw in KEYWORDS_REJECTION):
+    if any(kw in text_lower for kw in KEYWORDS_REJECTION) or _NEGATION_RE.search(text_lower):
         hits.append("rejection")
     if any(kw in text_lower for kw in KEYWORDS_CORRECTION):
         hits.append("correction")

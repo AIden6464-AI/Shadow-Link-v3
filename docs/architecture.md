@@ -27,9 +27,10 @@ The "shadow of you." It learns your linguistic shape from your past AI correctio
 *   **Temporal Decay (`decay.py`):** Automatically decays the utility of reactions over time:
     $$W(t) = W_0 \cdot e^{-\lambda \Delta t}$$
     *   `reminder` (standing style/architectural rules) never decays ($\lambda \to 0$, infinite half-life).
-    *   `request` and `pivot` (tactical/local fixes) have a 12-hour half-life.
-    *   `rejection` and `correction` (session-scoped) have a 1.5-hour half-life.
-    *   Each retrieval hit re-arms the decay clock.
+    *   `request` and `pivot` (tactical/local fixes) have a 7-day half-life.
+    *   `rejection` and `correction` have a 3-day half-life.
+    *   Decay never drops a reply below 25% of its base weight (`SHADOW_WEIGHT_FLOOR`); rejecting a ghost is what removes it.
+    *   Each ghost that surfaces a reply re-arms that reply's decay clock.
 *   **Graph Database (`database.py`):** A SQLite database storing:
     *   **Prompts (nodes):** text, primary bucket, weight, metadata (JSON containing token caches, session, source, and secondary buckets).
     *   **Prompt Edges:** Pairwise Jaccard weights between nodes to allow BFS theme clustering at a similarity floor ($\ge 0.30$).
