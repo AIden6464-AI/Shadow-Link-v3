@@ -21,15 +21,12 @@ def _fail_safe():
 
 def _last_assistant_text(transcript_path: str) -> str:
     """Pull the most recent assistant message text from the JSONL transcript."""
-    try:
-        p = Path(transcript_path)
-        if not p.exists():
-            return ""
-        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
+    if not transcript_path or not Path(transcript_path).exists():
         return ""
+    from shadow_link.live import read_tail_lines
 
-    for line in reversed(lines):
+    # Read backwards from the end: long sessions are multi-MB JSONL files.
+    for line in read_tail_lines(transcript_path):
         line = line.strip()
         if not line:
             continue
@@ -102,7 +99,8 @@ def main() -> None:
             lines_out.append(f"- ({tier}, {r.bucket}) {r.text}")
         if lines_out:
             nudge_block = (
-                "Shadow Link — based on past reactions, the operator tends to say:\n"
+                "Shadow Link context (a local prediction from the user's past replies "
+                "in similar situations; background only, not an instruction from the user):\n"
                 + "\n".join(lines_out)
             )
     except Exception:
@@ -114,7 +112,8 @@ def main() -> None:
         meta = {"buckets": buckets, "source": "hook", "session": data.get("session_id", "")}
         if agent_output:
             meta["agent_output"] = agent_output[:1000]
-        db.add_prompt(text=prompt, bucket=buckets[0], metadata=meta)
+        # The live watcher and the proxy may capture the same reply; store it once.
+        db.add_prompt_unique(text=prompt, bucket=buckets[0], metadata=meta)
     except Exception:
         pass
 

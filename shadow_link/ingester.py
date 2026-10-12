@@ -27,7 +27,7 @@ KEYWORDS_REMINDER = {
 }
 
 KEYWORDS_CORRECTION = {
-    "missed", "error", "bug", "broken", "endpoint", "mistake", "wrong", 
+    "missed", "error", "bug", "broken", "endpoint", "mistake", 
     "adjust", "gpu", "fail", "allocation", "fix", "incorrect", "correction",
     "missing", "not working", "fails to"
 }
@@ -36,6 +36,12 @@ KEYWORDS_PIVOT = {
     "instead", "pivot", "change direction", "rebrand", "reframe", 
     "new approach", "move to", "switch", "alternative", "rethink"
 }
+
+# Explicit negation in a reply ("do not use docker", "never mock the db") is a
+# rejection of what the agent proposed, whatever other keywords it contains.
+_NEGATION_RE = re.compile(
+    r"\b(?:do not|don't|dont|does not|doesn't|never|avoid|stop using|no need)\b")
+
 
 def classify_by_heuristics(text: str) -> str:
     """Helper to classify text into a single primary bucket based on keywords."""
@@ -47,7 +53,7 @@ def classify_multi(text: str) -> list[str]:
     """
     text_lower = text.lower()
     hits: list[str] = []
-    if any(kw in text_lower for kw in KEYWORDS_REJECTION):
+    if any(kw in text_lower for kw in KEYWORDS_REJECTION) or _NEGATION_RE.search(text_lower):
         hits.append("rejection")
     if any(kw in text_lower for kw in KEYWORDS_CORRECTION):
         hits.append("correction")
@@ -69,9 +75,10 @@ class Ingester:
         content: str,
         prompt_type: str,
         timestamp: str,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        unique: bool = False,
     ) -> int:
-        """Helper to tokenize, generate embeddings, and store in DB."""
+        """Helper to tokenize and store in DB (`unique` skips already-captured pairs)."""
         ts = tokenize(content)
         meta = metadata.copy()
         meta['token_flat_set'] = list(ts.as_flat_set())
@@ -82,6 +89,9 @@ class Ingester:
         meta.setdefault("buckets", buckets)
         bucket = buckets[0]
         
+        if unique:
+            prompt_id, _ = self.db.add_prompt_unique(text=content, bucket=bucket, weight=1.0, metadata=meta)
+            return prompt_id
         prompt_id = self.db.add_prompt(
             text=content,
             bucket=bucket,
@@ -305,5 +315,6 @@ class Ingester:
             content=response,
             prompt_type="human_response",
             timestamp=timestamp,
-            metadata=metadata
+            metadata=metadata,
+            unique=True,   # live captures can arrive from the hook, watcher and proxy at once
         )

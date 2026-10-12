@@ -1,0 +1,14 @@
+{
+  "name": "shadow-link",
+  "owner": {
+    "name": "Shadow Link"
+  },
+  "description": "Shadow Link for Claude Code: your likely reply floating above the chat bar.",
+  "plugins": [
+    {
+      "name": "shadow-link",
+      "source": "./plugin",
+      "description": "Shadow floats above the Claude Code chat bar: your likely reply, why, and a side chat that knows the session."
+    }
+  ]
+}

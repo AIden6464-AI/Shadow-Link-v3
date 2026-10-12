@@ -1,0 +1,27 @@
+{
+  "name": "shadow-link",
+  "version": "0.1.0",
+  "description": "Shadow floats above the Claude Code chat bar: your likely reply as you'd type it, why, and a side chat that knows the session.",
+  "author": { "name": "Shadow Link" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "daemon_url": {
+      "type": "string",
+      "title": "Shadow Link daemon URL",
+      "description": "Where `shadow-link daemon` listens.",
+      "default": "http://localhost:5000"
+    },
+    "min_confidence": {
+      "type": "number",
+      "title": "Minimum ghost confidence",
+      "description": "Ghosts scoring below this are not shown (0-1).",
+      "default": 0.15
+    },
+    "suggest_in_prompt": {
+      "type": "boolean",
+      "title": "Ghost text in the chat bar",
+      "description": "Show the ghost as dim text in the prompt box, Tab to take it.",
+      "default": true
+    }
+  }
+}

@@ -27,9 +27,10 @@ The "shadow of you." It learns your linguistic shape from your past AI correctio
 *   **Temporal Decay (`decay.py`):** Automatically decays the utility of reactions over time:
     $$W(t) = W_0 \cdot e^{-\lambda \Delta t}$$
     *   `reminder` (standing style/architectural rules) never decays ($\lambda \to 0$, infinite half-life).
-    *   `request` and `pivot` (tactical/local fixes) have a 12-hour half-life.
-    *   `rejection` and `correction` (session-scoped) have a 1.5-hour half-life.
-    *   Each retrieval hit re-arms the decay clock.
+    *   `request` and `pivot` (tactical/local fixes) have a 7-day half-life.
+    *   `rejection` and `correction` have a 3-day half-life.
+    *   Decay never drops a reply below 25% of its base weight (`SHADOW_WEIGHT_FLOOR`); rejecting a ghost is what removes it.
+    *   Each ghost that surfaces a reply re-arms that reply's decay clock.
 *   **Graph Database (`database.py`):** A SQLite database storing:
     *   **Prompts (nodes):** text, primary bucket, weight, metadata (JSON containing token caches, session, source, and secondary buckets).
     *   **Prompt Edges:** Pairwise Jaccard weights between nodes to allow BFS theme clustering at a similarity floor ($\ge 0.30$).
@@ -37,14 +38,17 @@ The "shadow of you." It learns your linguistic shape from your past AI correctio
 
 ---
 
-## 2. The Proxy Optimizer Logic (`claude-proxy`)
+## 2. The Claude Code Proxy (`proxy.py`)
 
-A transparent prompt-cache optimizer sitting between Claude Code/Desktop and Anthropic to make daily AI usage more cost-effective.
+An optional mitmproxy addon between Claude Code and the Anthropic Messages API. It learns reaction pairs and can add Shadow Link context, without disturbing the conversation Claude Code sends.
 
-*   **`optimize_payload()` (`proxy.py`):** Hoists "dynamic saboteurs" (e.g., `<system-reminder>` nudges, billing headers, dynamic dates like *"Today's date is..."*) out of the system block and mid-conversation messages. It then appends them to the final user message (safely placed after any leading `tool_result` blocks to respect Anthropic API ordering invariants).
-    *   **Why?** This keeps the static system/message prefix byte-identical across conversation turns, maximizing Anthropic KV prompt-cache hit rates.
-*   **Dual-Gated Proxying:** Only intercepts `POST /v1/messages` with a `claude-cli` user-agent. Standard Desktop/web traffic remains untouched.
-*   **Audit Logging:** Logs request optimization sizes, original vs. optimized bytes, and cache hit metrics to `claude_audit/YYYY-MM-DD.jsonl`.
+*   **History stays byte-stable:** the proxy never edits earlier turns, the system prompt or the tools. Claude Code already keeps its history stable, and two API behaviours depend on that: prompt caching (a changed earlier turn re-bills everything after it) and the thinking-block history check on Opus 5.5 / Fable 5.1 / Sonnet 5.5 / Haiku 5.5 (a 400 for accounts created on or after 2026-08-31).
+*   **Injection (`apply_injections()`), off by default:** when `SHADOW_LINK_INJECT=true`, one text block is appended at the end of the new user message, after any tool results. The `InjectionLedger` (`claude_audit/injections.jsonl`) records it, and every later request re-appends exactly the same text to that message. The preferred channel is the `UserPromptSubmit` hook (`shadow_hook.py`), whose output Claude Code adds as context itself.
+*   **Wording:** injected context says it is a local prediction from past replies, not a message or instruction from the user. A synthesized ghost is only included with `SHADOW_LINK_INJECT_SYNTHESIZED=true`.
+*   **Learning from the request:** each request already holds Claude's previous reply and what the user typed, so pairs are learned there (in the background) instead of from the response.
+*   **Streaming-safe:** SSE responses are streamed through unbuffered; `SSETap` reads usage and Claude's reply text from the events as they pass.
+*   **Gated:** only `POST /v1/messages` (not `count_tokens` or batches) with a `claude-cli` user agent.
+*   **Audit log:** request size, whether anything was injected, and response usage go to `claude_audit/YYYY-MM-DD.jsonl`.
 
 ---
 

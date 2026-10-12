@@ -43,6 +43,33 @@ On Windows, if mitmproxy fails to install:
 pip install --only-binary :all: mitmproxy
 ```
 
+## Shadow in Claude Code (recommended)
+
+Shadow floats right above the Claude Code chat bar. After each Claude turn it shows the reply you would likely send, also as dim text in the chat bar (Tab to take it). It explains its guess, and it answers side questions about the session without adding anything to Claude's conversation.
+
+Install it from inside Claude Code (version 2.1.275 or later):
+
+```
+/plugin install shadow-link --marketplace AIden6464-AI/Shadow-Link-v3
+```
+
+Answer `y` to add the marketplace and pick the user scope. Then keep the daemon running in another terminal:
+
+```powershell
+shadow-link daemon
+```
+
+| In Claude Code | What it does |
+|---|---|
+| Tab | Take the ghost shown in the chat bar. |
+| `use` / `next` / `why` / `wrong` / `hide` | Buttons on the floating band (click, or focus the band with ctrl+x Tab and press `u` `n` `w` `x` `h`). |
+| `@shadow <question>` | Ask Shadow about the session. Claude never sees it; the answer floats above the chat bar with **send to Claude**. |
+| `/shadow` | Hide or show Shadow. `/shadow status` checks the daemon link. |
+
+Shadow learns from what you actually send: a sent ghost is reinforced, `wrong` down-weights it, and every reply you type is saved as a reaction pair. Side questions run through your own Claude Code session (`$.model.fork` over the session transcript, served from the prompt cache), so no extra API key is needed. Settings (daemon URL, minimum confidence, chat-bar ghost on or off) are in `/config`.
+
+The plugin lives in [`plugin/`](plugin/).
+
 ## Quick start
 
 Start the daemon in one terminal:
@@ -83,6 +110,8 @@ shadow-link ingest-claude-export path\to\conversations.json
 | `shadow-link run <command...>` | Wrap another CLI with inline ghost suggestions. |
 | `shadow-link proxy` | Run the mitmproxy addon in the foreground. |
 | `shadow-link mcp` | Run the stdio MCP server. |
+| `shadow-link aca <text> [--task id] [--kind error]` | Associative Context Activation: show what an event activates, why, and the decision signals. |
+| `shadow-link aca --replay --task <id>` | Replay everything ACA did for a task. |
 | `shadow-link clear` | Clear the corpus after confirmation. |
 | `shadow-link --help` | Show CLI help. |
 
@@ -128,7 +157,7 @@ Inside `/claude-shadow`:
 
 ## Claude Code proxy
 
-The optional proxy injects relevant memories, captures reaction pairs, and records local request/usage audit data.
+The optional proxy captures reaction pairs and records local request/usage audit data. It never edits earlier turns, so prompt caching and Claude's thinking-block history check keep working. Injecting Shadow Link context through the proxy is off by default (`proxy.inject_nudges`); the `UserPromptSubmit` hook (`shadow_hook.py`) is the preferred channel for that.
 
 Easiest setup:
 
@@ -177,7 +206,7 @@ Minimal local configuration:
   "proxy": {
     "daemon_url": "http://localhost:5000",
     "port": 8080,
-    "inject_nudges": true,
+    "inject_nudges": false,
     "learn": true
   }
 }
@@ -210,6 +239,13 @@ It exposes:
 - `shadow_draft` — predict a likely reply.
 - `shadow_accept` — reinforce a used prediction.
 - `shadow_stats` — inspect corpus health.
+- `shadow_activate` — Associative Context Activation for an event.
+- `shadow_remember` — store a typed cognitive object (decision, error, fix, …) with links.
+- `shadow_aca_feedback` — tell ACA whether pulled context helped (reinforces the path).
+
+## Associative Context Activation
+
+ACA asks *"what does this event activate?"* instead of *"what should I search for?"*. It seeds a typed cognitive graph, spreads activation, suppresses stale/duplicate/superseded/irrelevant nodes, converges to a small explained context, fires Jev-shaped decision neurons, and loops. See [`docs/aca.md`](docs/aca.md).
 
 ## API
 
@@ -223,7 +259,7 @@ The API has no authentication and uses permissive CORS. Do not expose it to othe
 python tests\test_full.py
 ```
 
-The suite covers the matcher, database, MCP server, capture hook, subprocess wrapper, proxy optimizer, API, and TUI.
+The suite covers the matcher, database, MCP server, capture hook, subprocess wrapper, Claude Code proxy, API, TUI, ACA, and ghost decay.
 
 ## Notes
 
@@ -232,6 +268,7 @@ The suite covers the matcher, database, MCP server, capture hook, subprocess wra
 - Embeddings and chat inference are local unless you configure remote endpoints.
 - The project is primarily developed for Windows Terminal and PowerShell.
 - Architecture details: [`docs/architecture.md`](docs/architecture.md).
+- Associative Context Activation: [`docs/aca.md`](docs/aca.md).
 - Build blueprint: [`docs/SHADOW_LINK_BUILD_BLUEPRINT.md`](docs/SHADOW_LINK_BUILD_BLUEPRINT.md).
 
 ## License

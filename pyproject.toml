@@ -14,7 +14,7 @@ dependencies = [
     "httpx>=0.24.0",
     "pydantic>=2.0.0",
     "prompt-toolkit>=3.0.36",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "mitmproxy>=10.0.0"
 ]
 

@@ -117,6 +117,9 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.handle_proxy_status()
         elif path_str == "/proxy/audit":
             self.handle_proxy_audit(parsed_path)
+        elif path_str.startswith("/aca/"):
+            params = {k: v[0] for k, v in parse_qs(parsed_path.query).items()}
+            self.handle_aca(path_str, params)
         else:
             self.send_error(404, "Not found")
 
@@ -166,6 +169,8 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.handle_watch_proxy_event(data)
         elif parsed_path.path == "/watch/select":
             self.handle_watch_select(data)
+        elif parsed_path.path.startswith("/aca/"):
+            self.handle_aca(parsed_path.path, data)
         else:
             self.send_error(404, "Endpoint not found")
 
@@ -795,6 +800,77 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             logger.info(f"Connection closed by client during POST /proxy/stop: {e}")
         except Exception as e:
             logger.error(f"Error in POST /proxy/stop: {e}", exc_info=True)
+            self.send_error(500, str(e))
+
+    def handle_aca(self, path, data):
+        """Associative Context Activation endpoints (GET uses query params, POST a JSON body)."""
+        from shadow_link.aca import open_aca
+        try:
+            aca = open_aca(Config().db_path)
+            route = path[len("/aca/"):]
+            if route == "event":
+                if not data.get("text"):
+                    self.send_error(400, "Parameter 'text' is required")
+                    return
+                out = aca.process(
+                    data["text"], kind=data.get("kind", "prompt"), task_id=data.get("task_id"),
+                    goal=data.get("goal", ""), refs=data.get("refs"), project=data.get("project", ""),
+                    remember=data.get("remember"),
+                )
+            elif route == "node":
+                out = {"id": aca.store.add_node(
+                    data["content"], type=data.get("type", "memory"), title=data.get("title", ""),
+                    importance=float(data.get("importance", 0.5)), trust=data.get("trust"),
+                    project=data.get("project", ""), source=data.get("source", "api"),
+                    metadata=data.get("metadata"))}
+                out["contradicts"] = aca.detect_contradictions(out["id"])
+                for link in data.get("links", []):
+                    aca.store.link(out["id"], link["to"], link.get("rel", "related_to"),
+                                   strength=float(link.get("strength", 0.5)), source="api")
+            elif route == "link":
+                aca.store.link(data["src"], data["dst"], data.get("rel", "related_to"),
+                               strength=float(data.get("strength", 0.5)),
+                               confidence=float(data.get("confidence", 0.8)), source="api")
+                out = {"linked": True}
+            elif route == "feedback":
+                out = aca.feedback(data["task_id"], data["node_id"], bool(data.get("useful", True)))
+            elif route == "hypothesis":
+                out = {"id": aca.add_hypothesis(data["task_id"], data["text"],
+                                                float(data.get("prior", 0.5)), data.get("about"))}
+            elif route == "evidence":
+                out = aca.add_evidence(data["task_id"], data["hypothesis_id"], data.get("text"),
+                                       evidence_id=data.get("evidence_id"),
+                                       supports=bool(data.get("supports", True)),
+                                       weight=float(data.get("weight", 1.0)),
+                                       kind=data.get("kind", "observation"))
+            elif route == "action":
+                aca.report_action(data["task_id"], data["action"], bool(data.get("success")),
+                                  data.get("detail", ""))
+                out = {"recorded": True}
+            elif route == "close":
+                out = aca.close_task(data["task_id"], result=data.get("result", ""),
+                                     lesson=data.get("lesson", ""), procedure=data.get("procedure", ""))
+            elif route == "brain":
+                out = aca.snapshot(data["task_id"])
+            elif route == "inspect":
+                out = aca.inspect(data["task_id"], data["node_id"])
+            elif route == "replay":
+                out = aca.store.replay(data["task_id"], int(data.get("limit", 500)))
+            elif route == "stats":
+                out = aca.stats()
+            else:
+                self.send_error(404, f"Unknown ACA endpoint '{route}'")
+                return
+            self._set_headers(200)
+            self.wfile.write(json.dumps(out, default=str).encode("utf-8"))
+        except KeyError as e:
+            self.send_error(400, f"Missing parameter {e}")
+        except ValueError as e:
+            self.send_error(400, str(e))
+        except ConnectionError as e:
+            logger.info(f"Connection closed by client during {path}: {e}")
+        except Exception as e:
+            logger.error(f"Error in {path}: {e}", exc_info=True)
             self.send_error(500, str(e))
 
 def run_api_server(host="localhost", port=None):

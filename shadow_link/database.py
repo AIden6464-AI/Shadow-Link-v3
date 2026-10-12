@@ -67,7 +67,26 @@ CREATE TABLE IF NOT EXISTS prompt_vectors (
 CREATE INDEX IF NOT EXISTS idx_prompts_bucket    ON prompts(bucket);
 CREATE INDEX IF NOT EXISTS idx_prompts_weight    ON prompts(weight DESC);
 CREATE INDEX IF NOT EXISTS idx_edges_src         ON prompt_edges(src_id);
+CREATE INDEX IF NOT EXISTS idx_prompts_text      ON prompts(text);
 """
+
+# When one capture has no situation text (e.g. the hook found no transcript),
+# the same reply within this window is treated as the same event.
+DUPLICATE_WINDOW_SECONDS = 120.0
+
+
+def _norm_situation(meta: dict) -> str:
+    text = (meta.get("agent_output") or meta.get("question") or "")
+    return " ".join(text.split())[:1000]
+
+
+def _same_situation(a: str, b: str) -> bool:
+    """Situations from different capture paths can differ in framing (one text
+    block vs. all of them, different truncation); a shared 200-char opening of
+    the shorter one counts as the same situation."""
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return short[:200] in long_
+
 
 class Database:
     """SQLite interaction graph."""
@@ -118,6 +137,42 @@ class Database:
             new_id: int = cur.lastrowid
         self._update_edges_for(new_id)
         return new_id
+
+    def add_prompt_unique(
+        self,
+        text: str,
+        bucket: str = "request",
+        weight: float = 1.0,
+        metadata: dict | None = None,
+    ) -> tuple[int, bool]:
+        """
+        Insert a reaction pair unless it is already stored: same reply text and
+        the same situation (or, when either situation is missing, captured within
+        DUPLICATE_WINDOW_SECONDS). Short replies such as "continue" sent to
+        different situations stay separate pairs. Returns (id, created).
+        """
+        text = text.strip()
+        meta = metadata or {}
+        situation = _norm_situation(meta)
+        now = time.time()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, created_at, metadata FROM prompts WHERE text = ? ORDER BY id DESC LIMIT 50",
+                (text,),
+            ).fetchall()
+        for r in rows:
+            try:
+                other = json.loads(r["metadata"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                other = {}
+            other_situation = _norm_situation(other)
+            if situation and other_situation:
+                duplicate = _same_situation(situation, other_situation)
+            else:
+                duplicate = now - float(r["created_at"]) <= DUPLICATE_WINDOW_SECONDS
+            if duplicate:
+                return int(r["id"]), False
+        return self.add_prompt(text, bucket, weight, meta), True
 
     def get_prompt(self, prompt_id: int) -> dict | None:
         with self._connection() as conn:
