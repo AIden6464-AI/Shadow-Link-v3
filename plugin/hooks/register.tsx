@@ -128,7 +128,10 @@ async function ask($: EngineInterface, question: string) {
   })
   const recalled = (memory?.context ?? [])
     .slice(0, 6)
-    .map((i: any) => `- (${i.type}) ${String(i.content ?? '').slice(0, 300)}`)
+    .map((i: any) =>
+      i.type === 'reaction' && i.situation
+        ? `- When Claude said "${String(i.situation).slice(0, 200)}", the user replied "${String(i.content ?? '').slice(0, 200)}"`
+        : `- (${i.type}) ${String(i.content ?? '').slice(0, 300)}`)
     .join('\n')
 
   const prompt = [
