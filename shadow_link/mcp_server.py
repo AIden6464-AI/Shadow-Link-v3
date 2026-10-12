@@ -122,6 +122,50 @@ def shadow_stats() -> str:
     """
     return json.dumps(db.stats(), indent=2)
 
+_aca = None
+
+def _get_aca():
+    global _aca
+    if _aca is None:
+        from shadow_link.aca import open_aca
+        _aca = open_aca(cfg.db_path)
+    return _aca
+
+@mcp.tool()
+def shadow_activate(text: str, task_id: str = "", kind: str = "prompt", goal: str = "",
+                    refs: list[str] | None = None) -> str:
+    """
+    Associative Context Activation — ask "what does this activate?" instead of
+    "what should I search for?". Seeds the cognitive graph from an event
+    (prompt, error, tool result, file change, test failure, finding), spreads
+    activation, suppresses noise, and returns the small converged context with
+    why each item is active, plus decision signals and suggested actions.
+    """
+    out = _get_aca().process(text, kind=kind, task_id=task_id or None, goal=goal, refs=refs)
+    out.pop("jev_state", None)
+    return json.dumps(out, indent=2, default=str)
+
+@mcp.tool()
+def shadow_remember(content: str, type: str = "memory", title: str = "",
+                    links: list[str] | None = None, importance: float = 0.5) -> str:
+    """
+    Store a typed cognitive object (decision, error, fix, requirement, finding,
+    procedure, ...) and link it to existing node ids so ACA can activate it later.
+    """
+    aca = _get_aca()
+    nid = aca.store.add_node(content, type=type, title=title, importance=importance, source="mcp")
+    for other in links or []:
+        aca.store.link(nid, other, "related_to", strength=0.6, source="mcp")
+    return json.dumps({"id": nid, "contradicts": aca.detect_contradictions(nid)})
+
+@mcp.tool()
+def shadow_aca_feedback(task_id: str, node_id: str, useful: bool = True) -> str:
+    """
+    Learning loop — say whether a context item ACA pulled actually helped.
+    Reinforces or weakens the synapse path that activated it.
+    """
+    return json.dumps(_get_aca().feedback(task_id, node_id, useful), default=str)
+
 def run_mcp_server():
     mcp.run(transport="stdio")
 

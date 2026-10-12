@@ -83,6 +83,8 @@ shadow-link ingest-claude-export path\to\conversations.json
 | `shadow-link run <command...>` | Wrap another CLI with inline ghost suggestions. |
 | `shadow-link proxy` | Run the mitmproxy addon in the foreground. |
 | `shadow-link mcp` | Run the stdio MCP server. |
+| `shadow-link aca <text> [--task id] [--kind error]` | Associative Context Activation: show what an event activates, why, and the decision signals. |
+| `shadow-link aca --replay --task <id>` | Replay everything ACA did for a task. |
 | `shadow-link clear` | Clear the corpus after confirmation. |
 | `shadow-link --help` | Show CLI help. |
 
@@ -210,6 +212,13 @@ It exposes:
 - `shadow_draft` — predict a likely reply.
 - `shadow_accept` — reinforce a used prediction.
 - `shadow_stats` — inspect corpus health.
+- `shadow_activate` — Associative Context Activation for an event.
+- `shadow_remember` — store a typed cognitive object (decision, error, fix, …) with links.
+- `shadow_aca_feedback` — tell ACA whether pulled context helped (reinforces the path).
+
+## Associative Context Activation
+
+ACA asks *"what does this event activate?"* instead of *"what should I search for?"*. It seeds a typed cognitive graph, spreads activation, suppresses stale/duplicate/superseded/irrelevant nodes, converges to a small explained context, fires Jev-shaped decision neurons, and loops. See [`docs/aca.md`](docs/aca.md).
 
 ## API
 
@@ -232,6 +241,7 @@ The suite covers the matcher, database, MCP server, capture hook, subprocess wra
 - Embeddings and chat inference are local unless you configure remote endpoints.
 - The project is primarily developed for Windows Terminal and PowerShell.
 - Architecture details: [`docs/architecture.md`](docs/architecture.md).
+- Associative Context Activation: [`docs/aca.md`](docs/aca.md).
 - Build blueprint: [`docs/SHADOW_LINK_BUILD_BLUEPRINT.md`](docs/SHADOW_LINK_BUILD_BLUEPRINT.md).
 
 ## License

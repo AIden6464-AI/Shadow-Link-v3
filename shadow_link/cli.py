@@ -7,6 +7,8 @@ CLI entry point for Shadow Link v3 commands.
 from __future__ import annotations
 
 import argparse
+import json
+from datetime import datetime
 import os
 import sys
 from pathlib import Path
@@ -233,6 +235,50 @@ def handle_tui(args):
     from shadow_link.tui import run_tui
     run_tui()
 
+def handle_aca(args):
+    from shadow_link.aca import open_aca
+    aca = open_aca()
+    if args.replay:
+        if not args.task:
+            print("--replay needs --task")
+            return
+        for e in aca.store.replay(args.task):
+            stamp = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+            val = "" if e["value"] is None else f" {e['value']:.2f}"
+            print(f"{stamp} c{e['cycle']} {e['kind']:<22} {e['node_id']:<16}{val}  "
+                  f"{json.dumps(e['detail'], default=str)[:100]}")
+        return
+    text = " ".join(args.text).strip()
+    if not text:
+        print("Provide event text, e.g. shadow-link aca \"why did auth break again?\"")
+        return
+    out = aca.process(text, kind=args.kind, task_id=args.task or None)
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
+        return
+    f = out["funnel"]
+    print(f"task {out['task_id']}  ·  {out['cycles']} cycle(s)  ·  {out['elapsed_ms']} ms  ·  backend {out['backend']}")
+    print(f"funnel: {f['graph_nodes']} nodes → {f['activated']} activated → {f['significant']} significant"
+          f" → {f['highly_relevant']} highly relevant → {f['critical']} critical ({f['suppressed']} suppressed)")
+    print("\nACTIVE CONTEXT")
+    for i in out["context"]:
+        path = " → ".join(p["title"][:24] for p in i["why"]["path"]) or i["title"][:24]
+        flag = f"  ⚡ conflicts {', '.join(i['conflicts'])}" if i["conflicts"] else ""
+        print(f"  {i['score']:.2f} [{i['type']}] {i['title'][:60]}{flag}")
+        print(f"       why: {i['why']['seed_reason']} · {path}")
+    if out["hypotheses"]:
+        print("\nHYPOTHESES")
+        for h in out["hypotheses"]:
+            print(f"  {h['confidence']:.2f} {h['title']} ({h['status']})")
+    print("\nSIGNALS")
+    for s in out["signals"]:
+        top = f" → {s['top']}" if s.get("top") else ""
+        print(f"  {s['value']:.2f} {s['level']:<8} {s['name']}{top}")
+    if out["actions"]:
+        print("\nACTIONS")
+        for a in out["actions"]:
+            print("  " + ", ".join(f"{k}={v}" for k, v in a.items()))
+
 def main():
     parser = argparse.ArgumentParser(
         description="Shadow Link v3 — the local, terminal-native cognitive mirror"
@@ -313,6 +359,15 @@ def main():
     # MCP server command
     mcp_parser = subparsers.add_parser("mcp", help="Run stdio MCP server")
     mcp_parser.set_defaults(func=handle_mcp)
+
+    # Associative Context Activation
+    aca_parser = subparsers.add_parser("aca", help="Activate context for an event (Associative Context Activation)")
+    aca_parser.add_argument("text", nargs="*", help="Event text (prompt, error, observation, ...)")
+    aca_parser.add_argument("--task", type=str, default="", help="Task id to continue (recurrent context)")
+    aca_parser.add_argument("--kind", type=str, default="prompt", help="Event kind: prompt, error, tool_result, file_change, test_failure, ...")
+    aca_parser.add_argument("--replay", action="store_true", help="Print the replay log for --task instead")
+    aca_parser.add_argument("--json", action="store_true", help="Print the full JSON result")
+    aca_parser.set_defaults(func=handle_aca)
 
     # TUI command
     ui_parser = subparsers.add_parser("ui", help="Start the interactive terminal user interface dashboard")

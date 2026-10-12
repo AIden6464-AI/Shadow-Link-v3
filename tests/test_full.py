@@ -5,6 +5,10 @@ Tests:
   B. MCP Server (exposes tools over stdio)
   C. Capture Hook (simulated UserPromptSubmit event, capture + ghost prediction)
   D. Prompt Wrapper (mock run session of subprocess wrapper)
+  E. Proxy payload optimizer
+  F. TUI / daemon API
+  G. Associative Context Activation (store, spreading, inhibition, convergence,
+     neurons, recurrence, hypotheses, contradictions, learning, episodes, API)
 """
 
 import asyncio
@@ -89,8 +93,9 @@ async def test_mcp():
         async with ClientSession(read, write) as session:
             await session.initialize()
             names = {t.name for t in (await session.list_tools()).tools}
-            check("all six tools exposed by FastMCP", 
-                  names == {"shadow_log", "shadow_query", "shadow_nudge", "shadow_draft", "shadow_accept", "shadow_stats"})
+            check("all tools exposed by FastMCP",
+                  names == {"shadow_log", "shadow_query", "shadow_nudge", "shadow_draft", "shadow_accept",
+                            "shadow_stats", "shadow_activate", "shadow_remember", "shadow_aca_feedback"})
 
             async def call(tool, args):
                 r = await session.call_tool(tool, args)
@@ -476,6 +481,200 @@ def test_tui_initialization():
 
 
 
+# ------------------------------------------------------------------
+# G. Associative Context Activation
+# ------------------------------------------------------------------
+def _auth_graph():
+    from shadow_link.aca import ACA, CognitiveStore
+    s = CognitiveStore(":memory:")
+    aca = ACA(s)
+    n = {
+        "auth": s.add_node("Authentication subsystem: login, sessions, tokens", "architecture", "authentication"),
+        "tok": s.add_node("Token system issues access and refresh tokens", "architecture", "token system"),
+        "ref": s.add_node("Renews expired refresh tokens", "file", "refresh-token.ts"),
+        "ses": s.add_node("Session manager", "file", "session.ts"),
+        "bug": s.add_node("Previous auth bug: login broke because the refresh token expired", "fix", "previous token bug"),
+        "ui": s.add_node("Old discussion about button colours", "conversation", "old UI discussion"),
+        "old": s.add_node("Store sessions in memory", "decision", "in-memory sessions"),
+        "new": s.add_node("Store sessions in redis", "decision", "redis sessions"),
+    }
+    s.link(n["auth"], n["tok"], "part_of", strength=0.9)
+    s.link(n["tok"], n["ref"], "implemented_in", strength=0.85)
+    s.link(n["auth"], n["ses"], "related_to", strength=0.6)
+    s.link(n["bug"], n["ref"], "occurred_in", strength=0.9)
+    s.link(n["bug"], n["auth"], "related_to", strength=0.8)
+    s.link(n["ui"], n["auth"], "related_to", strength=0.1)
+    s.link(n["ses"], n["old"], "related_to", strength=0.7)
+    s.link(n["ses"], n["new"], "related_to", strength=0.7)
+    s.link(n["new"], n["old"], "supersedes", strength=0.9)
+    return s, aca, n
+
+
+def test_aca():
+    print("\nG. ASSOCIATIVE CONTEXT ACTIVATION")
+    from shadow_link.aca import Budget, JevBackend
+    from shadow_link.aca.activation import detect_seeds, spread, compete, extract_entities
+
+    s, aca, n = _auth_graph()
+
+    check("entity extraction finds files and error types",
+          {"refresh-token.ts", "RefreshTokenExpired"} <= set(extract_entities(
+              "login fails with RefreshTokenExpired in refresh-token.ts")))
+
+    seeds = detect_seeds(s, "why did auth break again? check refresh-token.ts")
+    seed_ids = {x.node_id for x in seeds}
+    check("seeds come from entity match and prefix match ('auth' ~ 'authentication')",
+          n["ref"] in seed_ids and n["auth"] in seed_ids)
+
+    acts, trav = spread(s, [type(seeds[0])(n["auth"], 1.0, "test")], Budget())
+    check("activation spreads to neighbours", n["tok"] in acts and n["ref"] in acts)
+    check("activation decays with distance",
+          acts[n["auth"]].activation > acts[n["tok"]].activation > acts[n["ref"]].activation)
+    check("weak synapses pass little activation",
+          acts.get(n["ui"]) is None or acts[n["ui"]].activation < acts[n["ses"]].activation)
+    check("activation path is recorded for explainability",
+          [nid for _, nid in acts[n["ref"]].path][-1] == n["ref"])
+    check("supersedes inhibits the older decision", acts[n["old"]].inhibition > 0)
+
+    cands = {c.id: c for c in compete(s, acts)}
+    check("superseded/inhibited decision is suppressed below its successor",
+          cands[n["old"]].score < cands[n["new"]].score)
+
+    s.set_status(n["old"], "superseded")
+    cands = {c.id: c for c in compete(s, acts)}
+    check("superseded status suppresses the node", cands[n["old"]].state == "suppressed")
+
+    out = aca.process("why did auth break again? login broke, refresh token", task_id="T1")
+    ids = [i["id"] for i in out["context"]]
+    check("process converges to a small context", 0 < len(ids) <= Budget().max_selected)
+    check("converged context contains the previous bug", n["bug"] in ids)
+    check("irrelevant UI discussion does not reach the context", n["ui"] not in ids)
+    check("every pulled item explains why it is active",
+          all(i["why"]["seed_reason"] and i["why"]["factors"] for i in out["context"]))
+    check("funnel narrows", out["funnel"]["activated"] >= out["funnel"]["critical"])
+    names = {x["name"] for x in out["signals"]}
+    check("standard neurons fire in parallel",
+          {"should_expand", "context_conflict", "needs_verification", "next_action", "remember"} <= names)
+    check("signals carry firing levels", all(x["level"] in
+          ("silent", "latent", "activate", "strong", "fire") for x in out["signals"]))
+    check("jev state has the documented shape", {"current_task", "active_context", "memories",
+          "hypotheses", "tool_results", "previous_failures", "project_constraints"} <= set(out["jev_state"]))
+
+    # contradictions are first-class and travel together
+    a_id = s.add_node("The API requires token rotation on refresh", "decision", "token rotation required")
+    b_id = s.add_node("The API does not require token rotation on refresh", "decision", "token rotation disabled")
+    check("polarity contradiction detected", a_id in aca.detect_contradictions(b_id))
+    out_c = aca.process("token rotation on refresh", task_id="T2")
+    cids = {i["id"] for i in out_c["context"]}
+    check("both sides of a contradiction are activated together", {a_id, b_id} <= cids)
+    check("conflict neuron fires on active contradiction",
+          next(x for x in out_c["signals"] if x["name"] == "context_conflict")["value"] > 0.7)
+
+    # hypothesis network
+    h1 = aca.add_hypothesis("T1", "expired refresh token", 0.5, about=[n["ref"]])
+    h2 = aca.add_hypothesis("T1", "external API outage", 0.3)
+    up = aca.add_evidence("T1", h1, "stack trace: RefreshTokenExpired", kind="error")
+    down = aca.add_evidence("T1", h2, "status page green, other endpoints fine", supports=False)
+    check("supporting evidence strengthens a hypothesis", up["posterior"] > up["prior"])
+    check("refuting evidence weakens a hypothesis", down["posterior"] < down["prior"])
+    for _ in range(3):
+        aca.add_evidence("T1", h2, "upstream health check ok", supports=False, kind="tool_result")
+    check("hypothesis eliminated once implausible", s.get_node(h2)["status"] == "refuted")
+
+    # learning loop
+    out2 = aca.process("refresh-token.ts renewal", task_id="T1")
+    target = next((i for i in out2["context"] if len(i["why"]["path"]) > 1), None)
+    check("a context item reached through the graph exists", target is not None)
+    if target:
+        path = [p["node"] for p in target["why"]["path"]]
+        before = {(e["src"], e["dst"], e["rel"]): e["strength"] for e in s.synapses_between(path)}
+        fb = aca.feedback("T1", target["id"], True)
+        after = {(e["src"], e["dst"], e["rel"]): e["strength"] for e in s.synapses_between(path)}
+        check("useful feedback reinforces the activation path",
+              fb["synapses"] and any(after[k] > before[k] for k in before))
+        aca.feedback("T1", target["id"], False)
+        check("useless feedback weakens the path",
+              any(e["fail_count"] > 0 for e in s.synapses_between(path)))
+
+    # inspector + replay + working brain
+    insp = aca.inspect("T1", out2["context"][0]["id"])
+    check("inspector explains activation", insp["in_context"] and insp["why"]["path"])
+    kinds = {e["kind"] for e in s.replay("T1")}
+    check("replay log records the cognition", {"event", "seed", "converged", "judgment",
+          "hypothesis_created", "hypothesis_strengthened", "feedback"} <= kinds)
+    snap = aca.snapshot("T1")
+    check("working brain snapshot lists hypotheses", snap["hypotheses"][0]["id"] == h1)
+
+    # episodes + consolidation
+    ep = aca.close_task("T1", result="resolved", lesson="check refresh-token state before outages")
+    check("episode stored and lesson consolidated into semantic memory",
+          s.get_node(ep["episode"])["type"] == "episode" and s.get_node(ep["semantic"])["type"] == "semantic")
+    out3 = aca.process("auth failing again, maybe an outage?", task_id="T3")
+    check("consolidated lesson is reactivated on a later task",
+          any(i["id"] in (ep["semantic"], ep["episode"]) for i in out3["context"])
+          or ep["semantic"] in aca.brain("T3").active or ep["episode"] in aca.brain("T3").active)
+
+    # Jev adapter: client answers some questions, the rest fall back
+    calls = []
+    def fake_client(state, questions):
+        calls.append(len(questions))
+        return {q["name"]: {"noul": 0.99} for q in questions if q["name"] == "should_expand"}
+    from shadow_link.aca import ACA
+    aca_j = ACA(s, backend=JevBackend(fake_client))
+    out_j = aca_j.process("why did auth break", task_id="T4", remember=False)
+    exp = next(x for x in out_j["signals"] if x["name"] == "should_expand")
+    check("Jev backend answers its questions and the rest fall back",
+          exp["backend"] == "jev" and any(x["backend"] == "heuristic" for x in out_j["signals"]))
+    check("high should_expand triggers a recurrent expansion cycle", out_j["cycles"] >= 2)
+
+    # corpus bridge: reaction pairs become graph nodes
+    from shadow_link.database import Database
+    test_db = ROOT / "_test_v3_aca.db"
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(test_db) + suffix)
+        if p.exists():
+            p.unlink()
+    db = Database(test_db)
+    db.add_prompt("do not use docker for local dev, use the venv", "rejection",
+                  metadata={"agent_output": "I will set up a Docker container for the dev environment"})
+    from shadow_link.aca import open_aca
+    aca_db = open_aca(test_db)
+    out_db = aca_db.process("I'll create a Docker container for development", task_id="D1")
+    check("reaction corpus is mirrored and a rejection activates despite its negation",
+          any(i["id"] == "P-1" for i in out_db["context"]))
+
+    # HTTP API
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+    from shadow_link.api import ShadowLinkAPIHandler
+    old = os.environ.get("DB_PATH")
+    os.environ["DB_PATH"] = str(test_db)
+    server = HTTPServer(("127.0.0.1", 0), ShadowLinkAPIHandler)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        req = urllib.request.Request(base + "/aca/event", method="POST",
+                                     data=json.dumps({"text": "set up docker for dev", "task_id": "API1"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        check("POST /aca/event returns converged context", res["task_id"] == "API1" and "context" in res)
+        rep = json.loads(urllib.request.urlopen(base + "/aca/replay?task_id=API1", timeout=10).read())
+        check("GET /aca/replay returns the task's events", any(e["kind"] == "converged" for e in rep))
+    finally:
+        server.shutdown()
+        server.server_close()
+        if old is None:
+            os.environ.pop("DB_PATH", None)
+        else:
+            os.environ["DB_PATH"] = old
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(test_db) + suffix)
+            if p.exists():
+                p.unlink()
+
+
 def main():
     test_engine()
     asyncio.run(test_mcp())
@@ -483,6 +682,7 @@ def main():
     asyncio.run(test_prompt_wrapper())
     test_proxy_optimizer()
     test_tui_initialization()
+    test_aca()
     print("\n" + "=" * 40)
     failed = [n for n, s in results if s == FAIL]
     print(f"{len(results) - len(failed)}/{len(results)} checks passed")
