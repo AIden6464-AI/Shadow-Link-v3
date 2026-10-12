@@ -7,186 +7,178 @@
 <p align="center">
   <strong>The shadow of you.</strong><br>
   Local. Terminal-native. Operator-controlled.<br><br>
-  <a href="https://github.com/ThatReid23/Shadow-Link-v3">Repository</a> ·
-  <a href="https://github.com/ThatReid23/Shadow-Link-v3/issues">Issues</a>
+  <a href="https://github.com/AIden6464-AI/Shadow-Link-v3">Repository</a> ·
+  <a href="https://github.com/AIden6464-AI/Shadow-Link-v3/issues">Issues</a>
 </p>
 
-A local, terminal-native cognitive mirror for AI coding workflows.
+Shadow Link learns how you react to AI coding agents and predicts your next reply. Every time you answer Claude ("no, don't use docker, use the venv"), it stores the pair *what Claude said → what you said back*. The next time Claude says something similar, Shadow shows the reply you'd likely send as a **ghost** you can send with one key.
 
-Shadow Link learns situation → reply pairs from your past AI conversations, predicts how you are likely to respond, and surfaces those predictions as editable "ghost" replies. It includes a polished terminal UI, live Claude Code session mirroring, an MCP server, file watchers, and an optional Claude Code proxy.
+It runs entirely on your machine: a local daemon and SQLite database, a Claude Code plugin that floats Shadow above the chat bar, a terminal UI, an MCP server, and an optional proxy.
 
-## Disclaimer
+<p align="center">
+  <img src="docs/assets/shadow-ghost.png" alt="Shadow floating above the Claude Code chat bar after Claude says it will set up Docker, suggesting: no, use the venv" width="720">
+</p>
 
-Shadow Link can read local conversation history and, when proxy mode is enabled, decrypt Claude Code traffic through mitmproxy. Review the configuration before running it, keep the daemon bound to localhost, and use it at your own risk.
+## Getting started
 
-This is a personal workflow tool. Predictions are suggestions—not authorization to take actions on your behalf.
+Requires Python 3.10+ and, for the plugin, Claude Code 2.1.275 or later.
 
-## Install
-
-Requires Python 3.10+.
-
-Clone and install:
+**1. Install Shadow Link**
 
 ```powershell
-git clone https://github.com/ThatReid23/Shadow-Link-v3.git
+git clone https://github.com/AIden6464-AI/Shadow-Link-v3.git
 cd Shadow-Link-v3
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .
 ```
 
-This installs the `shadow-link` command.
+On Windows, if mitmproxy fails to install: `pip install --only-binary :all: mitmproxy`.
 
-On Windows, if mitmproxy fails to install:
+**2. Start the daemon** and leave it running:
 
 ```powershell
-pip install --only-binary :all: mitmproxy
+shadow-link daemon
 ```
 
-## Shadow in Claude Code (recommended)
-
-Shadow floats right above the Claude Code chat bar. After each Claude turn it shows the reply you would likely send, also as dim text in the chat bar (Tab to take it). It explains its guess, and it answers side questions about the session without adding anything to Claude's conversation.
-
-Install it from inside Claude Code (version 2.1.275 or later):
+**3. Add Shadow to Claude Code.** In Claude Code:
 
 ```
 /plugin install shadow-link --marketplace AIden6464-AI/Shadow-Link-v3
 ```
 
-Answer `y` to add the marketplace and pick the user scope. Then keep the daemon running in another terminal:
+Answer `y` to add the marketplace and pick the user scope. To run the plugin straight from your clone instead, start Claude Code with `claude --plugin-dir plugin`.
 
-```powershell
-shadow-link daemon
-```
-
-| In Claude Code | What it does |
-|---|---|
-| Tab | Take the ghost shown in the chat bar. |
-| `use` / `next` / `why` / `wrong` / `hide` | Buttons on the floating band (click, or focus the band with ctrl+x Tab and press `u` `n` `w` `x` `h`). |
-| `@shadow <question>` | Ask Shadow about the session. Claude never sees it; the answer floats above the chat bar with **send to Claude**. |
-| `/shadow` | Hide or show Shadow. `/shadow status` checks the daemon link. |
-
-Shadow learns from what you actually send: a sent ghost is reinforced, `wrong` down-weights it, and every reply you type is saved as a reaction pair. Side questions run through your own Claude Code session (`$.model.fork` over the session transcript, served from the prompt cache), so no extra API key is needed. Settings (daemon URL, minimum confidence, chat-bar ghost on or off) are in `/config`.
-
-The plugin lives in [`plugin/`](plugin/).
-
-## Quick start
-
-Start the daemon in one terminal:
-
-```powershell
-shadow-link daemon
-```
-
-Open the TUI in another:
-
-```powershell
-shadow-link ui
-```
-
-Type `/` to open the command palette. Use `/claude-shadow` for the full-screen Claude Code mirror.
-
-To bootstrap the memory corpus from a Claude.ai export:
+**4. Give it some history (optional).** Shadow learns as you work, but you can start it off with your Claude.ai history:
 
 ```powershell
 shadow-link ingest-claude-export path\to\conversations.json
 ```
 
-## CLI commands
+## Shadow in Claude Code
+
+After each Claude reply, Shadow floats above the chat bar with the reply you'd likely send. The same reply appears dimmed inside the chat bar, so **Tab** takes it and **Enter** sends it. While Claude is working, Shadow stays out of the way.
+
+| In Claude Code | What it does |
+|---|---|
+| Tab, then Enter | Take the ghost from the chat bar and send it. |
+| `use` | Put the ghost in the chat bar so you can edit it before sending. |
+| `next` | Show the next most likely reply. |
+| `why` | Show what in your memory this situation brought back. |
+| `wrong` | Tell Shadow the guess was wrong; it weighs that reply less here and shows the next one. |
+| `hide` | Hide Shadow; `/shadow` brings it back. |
+| `@shadow <question>` | Ask Shadow about the session. Claude never sees it. |
+| `/shadow status` | Check the link to the daemon. |
+
+Click the buttons, or focus the floating card with ctrl+x Tab and press `u` `n` `w` `x` `h`.
+
+### Side questions
+
+Type `@shadow` and a question in the chat bar ("have I pushed back on docker before?", "what should I do next?"). Claude Code drops it before Claude sees it, and the answer floats above the chat bar with a **send to Claude** button.
+
+<p align="center">
+  <img src="docs/assets/shadow-ask.png" alt="Shadow answering a side question above the Claude Code chat bar, quoting the user's two earlier pushbacks on Docker" width="720">
+</p>
+
+Shadow answers from the session itself plus your memory in Shadow Link. It reads the session through your own Claude Code login, so there's no separate API key, and the usage counts toward your normal Claude Code usage.
+
+### What it learns
+
+- Every reply you send is saved as a pair with what Claude said before it.
+- A ghost you send is reinforced; one you mark `wrong` is weighed down.
+- The same reply captured by several paths (plugin, hook, watcher, proxy) is stored once.
+
+### Plugin settings
+
+In `/config`, under shadow-link:
+
+| Setting | Default | |
+|---|---|---|
+| Daemon URL | `http://localhost:5000` | Where `shadow-link daemon` listens. |
+| Minimum ghost confidence | `0.15` | Guesses below this aren't shown. |
+| Ghost text in the chat bar | on | Show the ghost dimmed in the chat bar (Tab to take). |
+
+The plugin's code is in [`plugin/`](plugin/).
+
+## How predictions work
+
+1. **Match.** The situation Claude just described is compared with every stored situation by word overlap, and by meaning too when an embedding server is configured.
+2. **Weigh.** Each match is scaled by its reply's weight. Weights fade over time unless a reply keeps getting used: corrections and rejections have a 3-day half-life, requests and pivots 7 days, and standing reminders ("always run the tests") never fade. Nothing fades below 25% of its weight; marking a ghost wrong is what removes it.
+3. **Show.** The best match becomes the ghost. With a local chat model running, Shadow can instead write a fresh reply in your style, grounded in the matches.
+
+**Associative Context Activation (ACA)** is the memory layer underneath. Instead of one search, it asks "what does this situation activate?": it follows links between memories, drops stale, duplicate or superseded ones, and returns a small set of context, each item saying why it was picked. Shadow's `why` and side questions use it. See [`docs/aca.md`](docs/aca.md).
+
+## Terminal UI
+
+```powershell
+shadow-link ui
+```
+
+Type a situation to see the predicted reply, or `/` for commands. `/claude-shadow` opens a full-screen mirror of your Claude Code session with the ghost underneath.
 
 | Command | What it does |
 |---|---|
-| `shadow-link ui` | Open the connected terminal UI. |
-| `shadow-link daemon` | Start the local API and live transcript watcher. |
-| `shadow-link daemon --proxy` | Start the daemon and managed Claude Code proxy. |
-| `shadow-link stats` | Show corpus and bucket counts. |
+| `/status` | Daemon, models, watcher, proxy and memory health. |
+| `/stats` | Memory, bucket, decay and weight statistics. |
+| `/query <text>` | Search stored replies. |
+| `/predict <situation>` | Predict your reply. Plain text does the same. |
+| `/ingest <situation> \| <reply>` | Teach a pair by hand. |
+| `/pairs [count]` | Browse recent pairs. |
+| `/live` | Watcher state, the current ghost and recent activity. |
+| `/claude-shadow` | Full-screen Claude Code mirror. |
+| `/accept`, `/reject`, `/edit <text>`, `/fix <text>` | Feedback on the current ghost. |
+| `/proxy status \| start \| stop \| view \| setup` | Manage the proxy. |
+| `/refresh`, `/clear`, `/help`, `/exit` | Housekeeping. |
+
+Inside `/claude-shadow`: `a`/`r` accept or reject, `e`/`f` edit or correct, `n`/`p` cycle guesses, `s` switch session, `V` full reply viewer, `P` toggle the proxy, `q` back.
+
+## CLI
+
+| Command | What it does |
+|---|---|
+| `shadow-link daemon` | Start the local API and the live transcript watcher. Add `--proxy` to also start the proxy. |
+| `shadow-link ui` | Open the terminal UI. |
+| `shadow-link ingest-claude-export <file>` | Import pairs from a Claude.ai export. |
+| `shadow-link ingest-md <file>` / `ingest-jsonl <file>` / `ingest-human <dir>` | Import from a Markdown prompt log, a trace log, or paired files. |
 | `shadow-link query <text>` | Search stored replies. |
-| `shadow-link interactive` | Run the fast-reply simulator. |
-| `shadow-link ingest-claude-export <file>` | Import reaction pairs from a Claude.ai export. |
-| `shadow-link ingest-jsonl <file>` | Import an OGI/oneiros trace log. |
-| `shadow-link ingest-human <dir>` | Import paired question/response files. |
-| `shadow-link ingest-md <file>` | Import a Markdown prompt log. |
-| `shadow-link watch <dir>` | Watch for question files and write ghost/response files. |
+| `shadow-link stats` | Memory and bucket counts. |
+| `shadow-link aca <text> [--task id] [--kind error]` | Show what an event activates in memory, and why. `--replay --task <id>` replays a task. |
+| `shadow-link mcp` | Run the MCP server. |
+| `shadow-link proxy` | Run the proxy in the foreground. |
 | `shadow-link run <command...>` | Wrap another CLI with inline ghost suggestions. |
-| `shadow-link proxy` | Run the mitmproxy addon in the foreground. |
-| `shadow-link mcp` | Run the stdio MCP server. |
-| `shadow-link aca <text> [--task id] [--kind error]` | Associative Context Activation: show what an event activates, why, and the decision signals. |
-| `shadow-link aca --replay --task <id>` | Replay everything ACA did for a task. |
-| `shadow-link clear` | Clear the corpus after confirmation. |
-| `shadow-link --help` | Show CLI help. |
+| `shadow-link watch <dir>` | Answer question files in a folder with ghost files. |
+| `shadow-link interactive` | A quick prediction prompt. |
+| `shadow-link clear` | Delete all stored pairs (asks first). |
 
-## TUI commands
+## Other ways to connect to Claude Code
 
-Type `/` in `shadow-link ui` to open the themed command palette.
+The plugin is all most people need. These are alternatives or additions:
 
-| Command | What it does |
-|---|---|
-| `/status` | Show daemon, models, watcher, proxy, and corpus health. |
-| `/stats` | Show corpus, graph, bucket, decay, and weight statistics. |
-| `/query <text>` | Search stored reply text. |
-| `/predict <situation>` | Predict your likely response. Plain text does the same thing. |
-| `/ingest <situation> \| <reply>` | Teach a situation → reply pair. |
-| `/pairs [count]` | Browse recent learned pairs. |
-| `/live` | Show watcher state, the active ghost, and recent activity. |
-| `/claude-shadow` | Open the animated full-screen Claude Code mirror. |
-| `/proxy status` | Show proxy state. |
-| `/proxy start [port]` | Start the managed proxy. |
-| `/proxy stop` | Stop the managed proxy. |
-| `/proxy view [count]` | Show recent proxy traffic and token usage. |
-| `/proxy setup [port]` | Start the proxy and create `claude-proxy.ps1`. |
-| `/accept [id]` | Use and reinforce a ghost. |
-| `/reject [id]` | Reject and down-weight a ghost. |
-| `/edit <text>` | Approve a ghost after reshaping it. |
-| `/fix <text>` | Reject a ghost and store your correction. |
-| `/refresh` | Reconnect to the daemon. |
-| `/clear` | Clear the terminal. |
-| `/help` | Show the command guide. |
-| `/exit`, `/quit` | Exit the TUI. |
+- **Live watcher** (part of `shadow-link daemon`): tails your Claude Code transcripts and learns pairs, even without the plugin.
+- **Prompt hook** (`shadow_hook.py`): a `UserPromptSubmit` hook that saves each prompt as a pair and adds Shadow's past reactions as context for Claude. Add it to `~/.claude/settings.json`:
 
-Inside `/claude-shadow`:
+  ```json
+  {
+    "hooks": {
+      "UserPromptSubmit": [
+        { "hooks": [{ "type": "command", "command": "python C:\\path\\to\\Shadow-Link-v3\\shadow_hook.py" }] }
+      ]
+    }
+  }
+  ```
 
-| Key | Action |
-|---|---|
-| `a` / `r` | Accept or reject the selected ghost. |
-| `e` / `f` | Edit or correct the selected ghost. |
-| `n` / `p` | Cycle through ghost alternatives. |
-| `s` | Switch Claude Code sessions. |
-| `V` | Toggle the full Claude response viewer. |
-| `P` | Start or stop the proxy. |
-| `q` | Return to the main TUI. |
+- **Proxy** (optional): a mitmproxy addon between Claude Code and the API that learns pairs and logs token usage. It never edits earlier turns, so prompt caching and Claude's thinking checks keep working, and it streams responses through untouched. Adding context through the proxy is off by default (`proxy.inject_nudges`). Run `/proxy setup` in the TUI, then the generated `claude-proxy.ps1`, or set it up by hand:
 
-## Claude Code proxy
-
-The optional proxy captures reaction pairs and records local request/usage audit data. It never edits earlier turns, so prompt caching and Claude's thinking-block history check keep working. Injecting Shadow Link context through the proxy is off by default (`proxy.inject_nudges`); the `UserPromptSubmit` hook (`shadow_hook.py`) is the preferred channel for that.
-
-Easiest setup:
-
-```text
-/proxy setup
-```
-
-Then run the generated PowerShell launcher:
-
-```powershell
-& .\claude-proxy.ps1
-```
-
-Manual setup:
-
-```powershell
-$env:HTTPS_PROXY = "http://127.0.0.1:8080"
-$env:NODE_EXTRA_CA_CERTS = "$HOME\.mitmproxy\mitmproxy-ca-cert.pem"
-$env:NO_PROXY = "localhost,127.0.0.1,::1"
-claude
-```
-
-The proxy only targets Anthropic message requests carrying the `claude-cli` user agent.
+  ```powershell
+  $env:HTTPS_PROXY = "http://127.0.0.1:8080"
+  $env:NODE_EXTRA_CA_CERTS = "$HOME\.mitmproxy\mitmproxy-ca-cert.pem"
+  $env:NO_PROXY = "localhost,127.0.0.1,::1"
+  claude
+  ```
 
 ## Configuration
 
-Create `config.json` in the project root. Environment variables override JSON values.
-
-Minimal local configuration:
+Create `config.json` in the project root (see [`config.sample.json`](config.sample.json)). Environment variables override it.
 
 ```json
 {
@@ -212,68 +204,71 @@ Minimal local configuration:
 }
 ```
 
-Set `SHADOW_LM_MODE=0` to disable generated replies and use retrieval only. Set `SHADOW_QUERY_EMBED=1` to enable semantic embeddings on prediction paths.
+| Environment variable | Effect |
+|---|---|
+| `SHADOW_LM_MODE=0` | Use stored replies only; don't write new ones with a local model. |
+| `SHADOW_QUERY_EMBED=1` | Match by meaning as well as words (needs an embedding server). |
+| `SHADOW_HALF_LIFE_EPHEMERAL_HOURS` | How fast corrections and rejections fade (default 72). |
+| `SHADOW_HALF_LIFE_TACTICAL_HOURS` | How fast requests and pivots fade (default 168). |
+| `SHADOW_WEIGHT_FLOOR` | The lowest fraction of its weight a reply can fade to (default 0.25). |
 
-The included `embed_server.py` requires `torch` and `transformers`:
-
-```powershell
-pip install torch transformers
-python embed_server.py
-```
-
-You can also point Shadow Link at LM Studio, Ollama, llama.cpp, or another OpenAI-compatible local endpoint.
+Local models work through any OpenAI-compatible endpoint: LM Studio, Ollama, llama.cpp. The included `embed_server.py` needs `pip install torch transformers`.
 
 ## MCP tools
 
-Run the server with:
+`shadow-link mcp` runs a stdio MCP server with:
 
-```powershell
-shadow-link mcp
-```
+- `shadow_log`: store a pair.
+- `shadow_query`: search stored replies.
+- `shadow_nudge`: past rejections, corrections and reminders relevant to some context.
+- `shadow_draft`: predict a likely reply.
+- `shadow_accept`: reinforce a prediction you used.
+- `shadow_stats`: memory health.
+- `shadow_activate`: ACA for an event.
+- `shadow_remember`: store a decision, error, fix or other typed memory, with links.
+- `shadow_aca_feedback`: say whether recalled context helped.
 
-It exposes:
+## Local API
 
-- `shadow_log` — store a reaction pair.
-- `shadow_query` — search stored replies.
-- `shadow_nudge` — retrieve behavioral reminders.
-- `shadow_draft` — predict a likely reply.
-- `shadow_accept` — reinforce a used prediction.
-- `shadow_stats` — inspect corpus health.
-- `shadow_activate` — Associative Context Activation for an event.
-- `shadow_remember` — store a typed cognitive object (decision, error, fix, …) with links.
-- `shadow_aca_feedback` — tell ACA whether pulled context helped (reinforces the path).
+`shadow-link daemon` serves JSON on `http://localhost:5000`:
 
-## Associative Context Activation
+| Endpoints | Purpose |
+|---|---|
+| `POST /predict`, `/query`, `/nudge` | Predictions and search. |
+| `POST /ingest`, `/feedback`, `/accept` | Learning and feedback. |
+| `GET /stats`, `/pairs`, `/live` | Memory and watcher state. |
+| `POST /aca/event`, `/aca/node`, `/aca/link`, `/aca/feedback`, `/aca/hypothesis`, `/aca/evidence`, `/aca/action`, `/aca/close`; `GET /aca/brain`, `/aca/inspect`, `/aca/replay`, `/aca/stats` | ACA. |
+| `GET /proxy/status`, `/proxy/audit`; `POST /proxy/start`, `/proxy/stop` | Proxy control. |
 
-ACA asks *"what does this event activate?"* instead of *"what should I search for?"*. It seeds a typed cognitive graph, spreads activation, suppresses stale/duplicate/superseded/irrelevant nodes, converges to a small explained context, fires Jev-shaped decision neurons, and loops. See [`docs/aca.md`](docs/aca.md).
-
-## API
-
-`shadow-link daemon` starts the JSON API at `http://localhost:5000` by default. The TUI, proxy, watcher, and external agents use this API for predictions, feedback, ingestion, live state, and proxy control.
-
-The API has no authentication and uses permissive CORS. Do not expose it to other machines or untrusted browser content.
+The API has no authentication and allows any origin. Keep it bound to localhost.
 
 ## Testing
 
 ```powershell
-python tests\test_full.py
+python tests\test_full.py          # daemon, memory, ACA, proxy, hook, MCP, TUI
+claude plugin test plugin          # the Claude Code plugin
+claude plugin validate .           # plugin + marketplace manifests
 ```
 
-The suite covers the matcher, database, MCP server, capture hook, subprocess wrapper, Claude Code proxy, API, TUI, ACA, and ghost decay.
+## Project layout
 
-## Notes
+| Path | What's there |
+|---|---|
+| `shadow_link/` | The daemon, matcher, memory, TUI, proxy and MCP server. |
+| `shadow_link/aca/` | Associative Context Activation. |
+| `plugin/` | The Claude Code plugin. |
+| `shadow_hook.py` | The optional `UserPromptSubmit` hook. |
+| `docs/` | [Architecture](docs/architecture.md), [ACA](docs/aca.md), [build blueprint](docs/SHADOW_LINK_BUILD_BLUEPRINT.md). |
+| `tests/` | The test suite. |
 
-- Local data is stored in `shadow_link.db`.
-- Proxy audit logs are stored in `claude_audit/`.
-- Embeddings and chat inference are local unless you configure remote endpoints.
-- The project is primarily developed for Windows Terminal and PowerShell.
-- Architecture details: [`docs/architecture.md`](docs/architecture.md).
-- Associative Context Activation: [`docs/aca.md`](docs/aca.md).
-- Build blueprint: [`docs/SHADOW_LINK_BUILD_BLUEPRINT.md`](docs/SHADOW_LINK_BUILD_BLUEPRINT.md).
+## Privacy and safety
+
+Everything stays on your machine unless you point Shadow Link at remote model endpoints. It reads your local Claude Code transcripts, and the optional proxy decrypts Claude Code traffic through mitmproxy, so review the configuration before running it. Your data lives in `shadow_link.db`, and proxy logs in `claude_audit/`.
+
+Predictions are suggestions, never permission to act for you: Shadow only sends a ghost when you do.
+
+The project is developed mainly for Windows Terminal and PowerShell.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-Repository: [github.com/ThatReid23/Shadow-Link-v3](https://github.com/ThatReid23/Shadow-Link-v3)  
-Issues: [github.com/ThatReid23/Shadow-Link-v3/issues](https://github.com/ThatReid23/Shadow-Link-v3/issues)
+MIT. See [LICENSE](LICENSE).
