@@ -43,6 +43,33 @@ On Windows, if mitmproxy fails to install:
 pip install --only-binary :all: mitmproxy
 ```
 
+## Shadow in Claude Code (recommended)
+
+Shadow floats right above the Claude Code chat bar. After each Claude turn it shows the reply you would likely send, also as dim text in the chat bar (Tab to take it). It explains its guess, and it answers side questions about the session without adding anything to Claude's conversation.
+
+Install it from inside Claude Code (version 2.1.275 or later):
+
+```
+/plugin install shadow-link --marketplace AIden6464-AI/Shadow-Link-v3
+```
+
+Answer `y` to add the marketplace and pick the user scope. Then keep the daemon running in another terminal:
+
+```powershell
+shadow-link daemon
+```
+
+| In Claude Code | What it does |
+|---|---|
+| Tab | Take the ghost shown in the chat bar. |
+| `use` / `next` / `why` / `wrong` / `hide` | Buttons on the floating band (click, or focus the band with ctrl+x Tab and press `u` `n` `w` `x` `h`). |
+| `@shadow <question>` | Ask Shadow about the session. Claude never sees it; the answer floats above the chat bar with **send to Claude**. |
+| `/shadow` | Hide or show Shadow. `/shadow status` checks the daemon link. |
+
+Shadow learns from what you actually send: a sent ghost is reinforced, `wrong` down-weights it, and every reply you type is saved as a reaction pair. Side questions run through your own Claude Code session (`$.model.fork` over the session transcript, served from the prompt cache), so no extra API key is needed. Settings (daemon URL, minimum confidence, chat-bar ghost on or off) are in `/config`.
+
+The plugin lives in [`plugin/`](plugin/).
+
 ## Quick start
 
 Start the daemon in one terminal:
