@@ -75,9 +75,10 @@ class Ingester:
         content: str,
         prompt_type: str,
         timestamp: str,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        unique: bool = False,
     ) -> int:
-        """Helper to tokenize, generate embeddings, and store in DB."""
+        """Helper to tokenize and store in DB (`unique` skips already-captured pairs)."""
         ts = tokenize(content)
         meta = metadata.copy()
         meta['token_flat_set'] = list(ts.as_flat_set())
@@ -88,6 +89,9 @@ class Ingester:
         meta.setdefault("buckets", buckets)
         bucket = buckets[0]
         
+        if unique:
+            prompt_id, _ = self.db.add_prompt_unique(text=content, bucket=bucket, weight=1.0, metadata=meta)
+            return prompt_id
         prompt_id = self.db.add_prompt(
             text=content,
             bucket=bucket,
@@ -311,5 +315,6 @@ class Ingester:
             content=response,
             prompt_type="human_response",
             timestamp=timestamp,
-            metadata=metadata
+            metadata=metadata,
+            unique=True,   # live captures can arrive from the hook, watcher and proxy at once
         )

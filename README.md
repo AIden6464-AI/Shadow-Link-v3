@@ -130,7 +130,7 @@ Inside `/claude-shadow`:
 
 ## Claude Code proxy
 
-The optional proxy injects relevant memories, captures reaction pairs, and records local request/usage audit data.
+The optional proxy captures reaction pairs and records local request/usage audit data. It never edits earlier turns, so prompt caching and Claude's thinking-block history check keep working. Injecting Shadow Link context through the proxy is off by default (`proxy.inject_nudges`); the `UserPromptSubmit` hook (`shadow_hook.py`) is the preferred channel for that.
 
 Easiest setup:
 
@@ -179,7 +179,7 @@ Minimal local configuration:
   "proxy": {
     "daemon_url": "http://localhost:5000",
     "port": 8080,
-    "inject_nudges": true,
+    "inject_nudges": false,
     "learn": true
   }
 }
@@ -232,7 +232,7 @@ The API has no authentication and uses permissive CORS. Do not expose it to othe
 python tests\test_full.py
 ```
 
-The suite covers the matcher, database, MCP server, capture hook, subprocess wrapper, proxy optimizer, API, and TUI.
+The suite covers the matcher, database, MCP server, capture hook, subprocess wrapper, Claude Code proxy, API, TUI, ACA, and ghost decay.
 
 ## Notes
 

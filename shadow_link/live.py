@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -179,6 +180,48 @@ def discover_all_transcripts(limit: int = 20) -> list[dict]:
         })
     return out
 
+_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def operator_text(content) -> str:
+    """The text a person actually typed in a user message: text blocks only,
+    with Claude Code's <system-reminder> spans removed. Tool results, images
+    and reminder-only blocks contribute nothing."""
+    if isinstance(content, str):
+        return _REMINDER_RE.sub("", content).strip()
+    if isinstance(content, list):
+        parts = [
+            _REMINDER_RE.sub("", b.get("text", ""))
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(p.strip() for p in parts if p.strip()).strip()
+    return ""
+
+
+def read_tail_lines(path: str, max_bytes: int = 4_000_000, chunk: int = 65_536):
+    """Yield complete JSONL lines from the end of a file, newest first,
+    reading backwards in chunks instead of loading the whole transcript."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fp:
+            end, carry, read = size, b"", 0
+            while end > 0 and read < max_bytes:
+                start = max(0, end - chunk)
+                fp.seek(start)
+                buf = fp.read(end - start) + carry
+                read += end - start
+                end = start
+                lines = buf.split(b"\n")
+                # The first piece may be a partial line unless we reached the file start.
+                carry = lines.pop(0) if start > 0 else b""
+                for raw in reversed(lines):
+                    if raw.strip():
+                        yield raw.decode("utf-8", errors="ignore")
+    except OSError:
+        return
+
+
 def is_real_reply(text: str) -> bool:
     """Filter out non-reactions: slash commands, CC wrappers, nudges, trivia."""
     t = (text or "").strip()
@@ -187,6 +230,7 @@ def is_real_reply(text: str) -> bool:
     markers = (
         "<command-name>", "<command-message>", "<local-command", "<system-reminder",
         "<bash-", "[Request interrupted", "Shadow Link — based on past reactions",
+        "Shadow Link context",
         "Caveat:", "Shell cwd was reset", "[Image",
         "A session-scoped Stop hook is now active",
         "CORPUS SHAPE", "SHADOW LINK", "GHOST (", "[CLAUDE]", "[GHOST",
@@ -214,7 +258,8 @@ class LiveWatcher:
         self.db_path = db_path
         self.transcript_path = transcript_path or discover_transcript()
         self._lock = threading.Lock()
-        self._seen_lines = 0
+        self._pos = 0              # byte offset of the next unread line
+        self._partial = b""        # trailing bytes of a line still being written
         self._primed = False
         self._last_claude = ""
         self._last_captured = ""
@@ -307,7 +352,8 @@ class LiveWatcher:
         db = Database(self.db_path)
         buckets = classify_multi(reply)
         meta = {"buckets": buckets, "source": "live", "agent_output": claude_output[:1000]}
-        db.add_prompt(text=reply, bucket=buckets[0], metadata=meta)
+        # The hook and the proxy may capture the same reply; store it once.
+        db.add_prompt_unique(text=reply, bucket=buckets[0], metadata=meta)
 
     def ingest_proxy_event(self, claude_reply: str) -> dict:
         """Proxy push path: Claude's response was just captured at the wire.
@@ -362,55 +408,72 @@ class LiveWatcher:
                 except Exception:
                     pass
 
+    def _read_new_lines(self) -> list[str]:
+        """Complete lines appended since the last read (incremental tail)."""
+        size = os.path.getsize(self.transcript_path)
+        if size < self._pos:          # truncated or replaced: start over
+            self._pos, self._partial = 0, b""
+        if size == self._pos:
+            return []
+        with open(self.transcript_path, "rb") as f:
+            f.seek(self._pos)
+            data = f.read(size - self._pos)
+        self._pos = size
+        data = self._partial + data
+        pieces = data.split(b"\n")
+        self._partial = pieces.pop()  # incomplete last line (or b"")
+        return [p.decode("utf-8", errors="ignore") for p in pieces if p.strip()]
+
+    def _prime(self):
+        """Start at the end of the transcript and predict on its last assistant turn."""
+        self._pos = os.path.getsize(self.transcript_path)
+        self._partial = b""
+        self._primed = True
+        last_assistant = ""
+        for line in read_tail_lines(self.transcript_path):
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") == "assistant":
+                txt = _extract_text(o.get("message", {}).get("content", ""))
+                if txt:
+                    last_assistant = txt
+                    break
+        if last_assistant:
+            # Run prediction on prime so /claude-shadow shows a ghost
+            # immediately, not only after the next assistant turn.
+            ghost, alts = self._predict(last_assistant)
+            with self._lock:
+                self._last_claude = last_assistant
+                self._state["claude_output"] = last_assistant
+                self._state["ghost"] = ghost
+                self._state["alternates"] = alts
+                self._state["updated_at"] = time.time()
+                self._log("claude", last_assistant)
+                if ghost:
+                    self._log("ghost", f"({ghost['tier']}) {ghost['text']}")
+
     def _loop(self):
         while self._running:
             if not self.transcript_path or not os.path.exists(self.transcript_path):
                 self.transcript_path = discover_transcript()
                 with self._lock:
                     self._state["transcript"] = self.transcript_path
+                self._primed = False
                 time.sleep(1.0)
                 continue
             try:
-                with open(self.transcript_path, encoding="utf-8", errors="ignore") as f:
-                    lines = f.read().splitlines()
+                if not self._primed:
+                    self._prime()
+                    time.sleep(1.0)
+                    continue
+                lines = self._read_new_lines()
             except OSError:
                 time.sleep(1.0)
                 continue
 
-            if not self._primed:
-                self._seen_lines = len(lines)
-                self._primed = True
-                last_assistant = ""
-                for line in reversed(lines):
-                    try:
-                        o = json.loads(line)
-                    except Exception:
-                        continue
-                    if o.get("type") == "assistant":
-                        txt = _extract_text(o.get("message", {}).get("content", ""))
-                        if txt:
-                            last_assistant = txt
-                            break
-                if last_assistant:
-                    # Run prediction on prime so /claude-shadow shows a ghost
-                    # immediately, not only after the next assistant turn.
-                    ghost, alts = self._predict(last_assistant)
-                    with self._lock:
-                        self._last_claude = last_assistant
-                        self._state["claude_output"] = last_assistant
-                        self._state["ghost"] = ghost
-                        self._state["alternates"] = alts
-                        self._state["updated_at"] = time.time()
-                        self._log("claude", last_assistant)
-                        if ghost:
-                            self._log("ghost", f"({ghost['tier']}) {ghost['text']}")
-                time.sleep(1.0)
-                continue
-
-            for i in range(self._seen_lines, len(lines)):
-                line = lines[i].strip()
-                if not line:
-                    continue
+            for line in lines:
                 try:
                     o = json.loads(line)
                 except Exception:
@@ -418,8 +481,9 @@ class LiveWatcher:
                 role = o.get("message", {}).get("role")
                 typ = o.get("type")
                 if typ in ("user", "assistant") and role in ("user", "assistant"):
-                    txt = _extract_text(o.get("message", {}).get("content", ""))
+                    content = o.get("message", {}).get("content", "")
+                    # User turns: only what the person typed, without Claude Code's reminders.
+                    txt = operator_text(content) if role == "user" else _extract_text(content)
                     if txt.strip():
                         self._handle(role, txt.strip())
-            self._seen_lines = len(lines)
             time.sleep(1.0)

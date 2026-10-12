@@ -44,13 +44,13 @@
   },
 
   "proxy": {
-    "_comment": "When inject_synthesized=true the proxy asks the daemon to run the local LLM and injects the synthesized ghost as the operator's likely reply, with retrieved snippets following as grounding evidence. nudge_budget_seconds caps the LLM wall-clock per request; nudge_timeout_seconds is the proxy->daemon HTTP timeout (must be > budget).",
+    "_comment": "inject_nudges appends Shadow Link context to your new message (off by default; the UserPromptSubmit hook is the preferred channel). inject_synthesized also includes the local LLM's predicted reaction. The lookup runs before the request is forwarded: nudge_timeout_seconds caps it, nudge_budget_seconds caps the LLM inside it (must be lower).",
     "daemon_url": "http://localhost:5000",
     "port": 8080,
-    "inject_nudges": true,
-    "inject_synthesized": true,
-    "nudge_budget_seconds": 4.0,
-    "nudge_timeout_seconds": 5.0,
+    "inject_nudges": false,
+    "inject_synthesized": false,
+    "nudge_budget_seconds": 0.8,
+    "nudge_timeout_seconds": 1.0,
     "learn": true
   }
 }

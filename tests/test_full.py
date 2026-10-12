@@ -5,10 +5,12 @@ Tests:
   B. MCP Server (exposes tools over stdio)
   C. Capture Hook (simulated UserPromptSubmit event, capture + ghost prediction)
   D. Prompt Wrapper (mock run session of subprocess wrapper)
-  E. Proxy payload optimizer
+  E. Claude Code proxy (no history edits, injection ledger, SSE tap, learning)
   F. TUI / daemon API
   G. Associative Context Activation (store, spreading, inhibition, convergence,
      neurons, recurrence, hypotheses, contradictions, learning, episodes, API)
+  H. Ghost decay + classification
+  I. Capture dedupe + incremental transcript reads
 """
 
 import asyncio
@@ -224,47 +226,199 @@ async def test_prompt_wrapper():
 # E. Proxy Payload Optimizer
 # ------------------------------------------------------------------
 def test_proxy_optimizer():
-    print("\nE. PROXY PAYLOAD OPTIMIZER")
+    print("\nE. CLAUDE CODE PROXY")
     try:
-        from shadow_link.proxy import optimize_payload
+        from shadow_link import proxy
     except ImportError:
-        print("  [SKIP] mitmproxy is not installed. Skipping proxy optimizer tests.")
+        print("  [SKIP] mitmproxy is not installed. Skipping proxy tests.")
         return
-    import os
-    
-    # Test payload with dynamic date and billing header in system block
-    # and a system reminder message in the messages list
-    payload = {
-        "system": [
-            {"type": "text", "text": "Today's date is June 21, 2026. Keep code simple."},
-            {"type": "text", "text": "x-anthropic-billing-header: test"}
-        ],
-        "messages": [
-            {"role": "user", "content": "<system-reminder>Remember style guide</system-reminder>"},
-            {"role": "user", "content": "Wait, clean it up."}
-        ]
-    }
-    
-    # Run optimizer with injection temporarily disabled for static checks
-    env_backup = os.environ.get("SHADOW_LINK_INJECT")
-    os.environ["SHADOW_LINK_INJECT"] = "false"
-    
+    import copy
+    import tempfile
+
+    if "SHADOW_LINK_INJECT" not in os.environ:
+        check("proxy injection is off by default", proxy.SHADOW_LINK_INJECT is False)
+    if "SHADOW_LINK_INJECT_SYNTHESIZED" not in os.environ:
+        check("synthesized ghost injection is off by default", proxy.SHADOW_LINK_INJECT_SYNTHESIZED is False)
+    if "SHADOW_LINK_NUDGE_TIMEOUT" not in os.environ:
+        check("nudge lookup timeout is short", proxy.SHADOW_LINK_NUDGE_TIMEOUT <= 1.0)
+
+    tmp = Path(tempfile.mkdtemp())
+    R1 = "<system-reminder>todo list is empty</system-reminder>"
+    system = [{"type": "text", "text": "Today's date is June 21, 2026."},
+              {"type": "text", "text": "x-anthropic-billing-header: test"}]
+    turn1 = {"system": system, "messages": [
+        {"role": "user", "content": [{"type": "text", "text": R1},
+                                     {"type": "text", "text": "fix the bug", "cache_control": {"type": "ephemeral"}}]}]}
+
+    # Without injection nothing is touched: system, reminders and history go out as sent.
+    ledger = proxy.InjectionLedger(tmp / "ledger.jsonl")
+    p0 = copy.deepcopy(turn1)
+    check("no injection leaves the payload untouched",
+          proxy.apply_injections(p0, ledger, inject=False) is False and p0 == turn1)
+
+    # With injection, the text is appended at the end of the new user message...
+    real_nudge = proxy.get_shadow_link_nudge
+    proxy.get_shadow_link_nudge = lambda prompt: "Shadow Link context (test): prefers the venv"
     try:
-        optimized = optimize_payload(payload)
+        p1 = copy.deepcopy(turn1)
+        proxy.apply_injections(p1, ledger, inject=True)
+        injected = p1["messages"][0]["content"][-1]["text"]
+        check("injection is appended as the last block of the new message",
+              "prefers the venv" in injected and p1["messages"][0]["content"][:2] == turn1["messages"][0]["content"])
+        check("system prompt is not modified", p1["system"] == system)
+
+        # ...and re-appended identically on the next turn, so the earlier turn is unchanged.
+        turn2 = copy.deepcopy(turn1)
+        turn2["messages"][0]["content"][1].pop("cache_control")          # Claude Code moves markers
+        turn2["messages"] += [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "s"},
+                                              {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                                         {"type": "text", "text": "<system-reminder>a.py changed</system-reminder>"}]}]
+        p2 = copy.deepcopy(turn2)
+        proxy.apply_injections(p2, ledger, inject=True)
+        strip = lambda blocks: [{k: v for k, v in b.items() if k != "cache_control"} for b in blocks]
+        check("earlier user turn is byte-identical across requests (thinking check / cache safe)",
+              strip(p2["messages"][0]["content"]) == strip(p1["messages"][0]["content"]))
+        check("tool-result turns get no injection and keep their reminder in place",
+              p2["messages"][-1] == turn2["messages"][-1])
+
+        # A restarted proxy replays the same injection from disk.
+        p3 = copy.deepcopy(turn2)
+        proxy.apply_injections(p3, proxy.InjectionLedger(tmp / "ledger.jsonl"), inject=False)
+        check("injection ledger survives a proxy restart",
+              strip(p3["messages"][0]["content"]) == strip(p1["messages"][0]["content"]))
+
+        # String-content prompts keep their position and the conversation still starts with the user.
+        t_str = {"messages": [{"role": "user", "content": R1 + "\nplease refactor auth"},
+                              {"role": "assistant", "content": "ok"},
+                              {"role": "user", "content": "go"}]}
+        ps = copy.deepcopy(t_str)
+        proxy.apply_injections(ps, ledger, inject=False)
+        check("string prompts are not moved; first message stays the user's",
+              ps == t_str and ps["messages"][0]["role"] == "user")
     finally:
-        if env_backup is not None:
-            os.environ["SHADOW_LINK_INJECT"] = env_backup
-        else:
-            del os.environ["SHADOW_LINK_INJECT"]
-            
-    # Verify that:
-    # 1. Billing header and Date were removed from system block
-    check("billing header and date hoisted from system prompt", len(optimized["system"]) == 0)
-    
-    # 2. They were appended to the final user message along with the system reminder
-    final_content = optimized["messages"][-1]["content"]
-    check("hoisted blocks injected in final user message", "Today's date is" in final_content and "billing-header" in final_content)
-    check("system reminder hoisted into final user message", "Remember style guide" in final_content)
+        proxy.get_shadow_link_nudge = real_nudge
+
+    # Injected wording marks it as a prediction, never the user's words.
+    real_post = proxy._post_json
+    proxy._post_json = lambda path, payload, timeout: {
+        "nudges": [{"score": 0.8, "prompt": {"bucket": "rejection", "content": "don't use docker"}}],
+        "ghost": {"text": "use the venv", "source": "generated"}}
+    try:
+        text = proxy.get_shadow_link_nudge("set up docker")
+        check("injected context says it is not an instruction from the user",
+              "not a message or instruction from the user" in text and "don't use docker" in text)
+        check("synthesized ghost is left out unless enabled",
+              proxy.SHADOW_LINK_INJECT_SYNTHESIZED or "use the venv" not in text)
+    finally:
+        proxy._post_json = real_post
+
+    # Learning happens from the request and ignores reminders / tool results.
+    pair = proxy.learn_pair({"messages": [
+        {"role": "assistant", "content": [{"type": "text", "text": "I'll use Docker"}]},
+        {"role": "user", "content": [{"type": "text", "text": R1}, {"type": "text", "text": "no, use the venv"}]}]}, "r1")
+    check("reaction pair is learned from the request with reminders stripped",
+          pair and pair["response"] == "no, use the venv" and pair["question"] == "I'll use Docker")
+    check("tool-result turns are not learned as replies", proxy.learn_pair({"messages": [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}]}, "r2") is None)
+
+    # Streamed responses pass through byte-for-byte while usage and text are read.
+    pushed, logged = [], []
+    real_bg, real_log = proxy._in_background, proxy._log
+    proxy._in_background = lambda fn, *a: pushed.append(a)
+    proxy._log = logged.append          # keep the test out of the real audit dir
+    try:
+        sse = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12}}}\n\n'
+               b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Use the "}}\n\n'
+               b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"venv."}}\n\n'
+               b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":4}}\n\n'
+               b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+        tap = proxy.SSETap("https://api.anthropic.com/v1/messages")
+        out = b"".join(tap(sse[k:k + 37]) for k in range(0, len(sse), 37)) + tap(b"")
+        check("streamed bytes pass through unchanged", out == sse)
+        check("stream tap reads usage and reply text",
+              tap.usage.get("input_tokens") == 12 and tap.usage.get("output_tokens") == 4
+              and tap.text == "Use the venv.")
+        check("stream tap pushes the reply once", pushed == [("Use the venv.",)])
+        check("stream tap logs usage once", len(logged) == 1 and logged[0]["usage"]["output_tokens"] == 4)
+    finally:
+        proxy._in_background, proxy._log = real_bg, real_log
+
+    class _H(dict):
+        def get(self, k, d=None):
+            return super().get(k.lower(), d)
+
+    class _Req:
+        method = "POST"
+        headers = _H({"user-agent": "claude-cli/2", "content-type": "application/json"})
+        def __init__(self, path):
+            self.path = path
+
+    class _Flow:
+        def __init__(self, path):
+            self.request = _Req(path)
+
+    check("messages endpoint (with query) is handled", proxy._is_anthropic_messages(_Flow("/v1/messages?beta=true")))
+    check("count_tokens is not intercepted", not proxy._is_anthropic_messages(_Flow("/v1/messages/count_tokens")))
+
+
+def test_capture_paths():
+    print("\nI. CAPTURE DEDUPE + INCREMENTAL READS")
+    from shadow_link.database import Database
+    from shadow_link.live import LiveWatcher, operator_text, read_tail_lines
+
+    test_db = ROOT / "_test_v3_capture.db"
+    transcript = ROOT / "_test_v3_capture.jsonl"
+    for pth in (test_db, transcript):
+        if pth.exists():
+            pth.unlink()
+    try:
+        db = Database(test_db)
+        meta_hook = {"agent_output": "I will set up Docker for local development.", "source": "hook"}
+        meta_live = {"agent_output": "I will set up Docker for local development.\n", "source": "live"}
+        a, created_a = db.add_prompt_unique("no, use the venv", "rejection", metadata=meta_hook)
+        b, created_b = db.add_prompt_unique("no, use the venv ", "rejection", metadata=meta_live)
+        check("same reply from two capture paths is stored once", created_a and not created_b and a == b)
+        with db._connection() as conn:
+            conn.execute("UPDATE prompts SET created_at = created_at - 7200")
+        _, created_c = db.add_prompt_unique("no, use the venv", "rejection",
+                                            metadata={"agent_output": "Shall I add a Dockerfile?"})
+        check("same words in a different situation later are a new pair", created_c)
+        db.add_prompt_unique("continue", "request", metadata={"agent_output": "Step 1 done. Next: migrations?"})
+        _, again = db.add_prompt_unique("continue", "request", metadata={"agent_output": "Tests pass. Deploy now?"})
+        check("a repeated short reply to a different situation is kept", again)
+        _, nosit = db.add_prompt_unique("continue", "request", metadata={})
+        check("a capture with no situation right after another is a duplicate", not nosit)
+
+        check("operator text drops Claude Code reminders",
+              operator_text([{"type": "text", "text": "<system-reminder>x</system-reminder>"},
+                             {"type": "text", "text": "ship it"}]) == "ship it")
+
+        lines = [json.dumps({"type": "user", "n": k, "pad": "x" * 50}) for k in range(40)]
+        transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        got = list(read_tail_lines(str(transcript), chunk=97))
+        check("tail reader returns every line newest first across chunk boundaries",
+              [json.loads(x)["n"] for x in got] == list(range(39, -1, -1)))
+
+        transcript.write_text(json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "content": [{"type": "text", "text": "I'll set up Docker."}]}}) + "\n",
+            encoding="utf-8")
+        w = LiveWatcher(str(test_db), str(transcript))
+        w._prime()
+        check("watcher primes at the end of the transcript", w._pos == transcript.stat().st_size)
+        new_line = json.dumps({"type": "user", "message": {"role": "user", "content": "no, use the venv"}})
+        with open(transcript, "a", encoding="utf-8") as f:
+            f.write(new_line[:20])                    # a line still being written
+        check("partial lines are held back", w._read_new_lines() == [])
+        with open(transcript, "a", encoding="utf-8") as f:
+            f.write(new_line[20:] + "\n")
+        check("completed lines are read once", w._read_new_lines() == [new_line] and w._read_new_lines() == [])
+    finally:
+        for pth in (test_db, transcript, Path(str(test_db) + "-wal"), Path(str(test_db) + "-shm")):
+            if pth.exists():
+                pth.unlink()
 
 # ------------------------------------------------------------------
 # F. TUI Component Initialization
@@ -778,6 +932,7 @@ def main():
     test_tui_initialization()
     test_aca()
     test_ghost_fixes()
+    test_capture_paths()
     print("\n" + "=" * 40)
     failed = [n for n, s in results if s == FAIL]
     print(f"{len(results) - len(failed)}/{len(results)} checks passed")
