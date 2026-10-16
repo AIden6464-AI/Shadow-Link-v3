@@ -126,6 +126,39 @@ def test_add_prompt_unique_is_atomic(tmp_path: Path):
     assert len(db.all_prompts()) == 1
 
 
+def test_edges_from_the_token_index_match_comparing_everything(tmp_path: Path):
+    """Indexing by shared tokens must find exactly the edges a full comparison finds."""
+    import random
+    from shadow_link.tokenizer import jaccard, tokenize
+    rng = random.Random(7)
+    words = "docker venv postgres auth login test fix build deploy cache api retry not never use keep the a".split()
+    texts = [" ".join(rng.choice(words) for _ in range(rng.randint(2, 7))) for _ in range(60)]
+    db = Database(tmp_path / "e.db")
+    for t in texts:
+        db.add_prompt(t)
+    got = {(e["src_id"], e["dst_id"]): round(e["weight"], 9) for e in db.get_edges()}
+    rows = db.all_prompts()
+    want = {}
+    for i, a in enumerate(rows):            # the old way: each new reply against every earlier one
+        for b in rows[:i]:
+            w = jaccard(tokenize(a["text"]), db._get_cached_tokens(b))
+            if w > 0:
+                want[(min(a["id"], b["id"]), max(a["id"], b["id"]))] = round(w, 9)
+    assert got == want and len(got) > 50
+
+
+def test_old_databases_get_their_token_index_backfilled(tmp_path: Path):
+    db = Database(tmp_path / "b.db")
+    db.add_prompt("use the venv for dev")
+    with db._connection() as conn:              # a database from before prompt_terms existed
+        conn.execute("DELETE FROM prompt_terms")
+    db.add_prompt("dev uses a venv too")
+    assert len(db.get_edges()) == 1
+    with db._connection() as conn:
+        indexed = {r[0] for r in conn.execute("SELECT DISTINCT prompt_id FROM prompt_terms")}
+    assert indexed == {p["id"] for p in db.all_prompts()}
+
+
 def test_new_node_types_are_known(tmp_path: Path):
     store = CognitiveStore(tmp_path / "n.db")
     for t in ("agent_session", "activity", "open_thread", "handoff", "project", "digest"):

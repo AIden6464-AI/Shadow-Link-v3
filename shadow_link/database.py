@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS prompt_vectors (
     FOREIGN KEY (prompt_id) REFERENCES prompts(id)
 );
 
+-- Which replies contain which tokens, so a new reply is compared only with
+-- replies it shares a token with (see _update_edges_for).
+CREATE TABLE IF NOT EXISTS prompt_terms (
+    term      TEXT    NOT NULL,
+    prompt_id INTEGER NOT NULL,
+    PRIMARY KEY (term, prompt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_terms_prompt ON prompt_terms(prompt_id);
+
 CREATE INDEX IF NOT EXISTS idx_prompts_bucket    ON prompts(bucket);
 CREATE INDEX IF NOT EXISTS idx_prompts_weight    ON prompts(weight DESC);
 CREATE INDEX IF NOT EXISTS idx_edges_src         ON prompt_edges(src_id);
@@ -271,6 +280,7 @@ class Database:
         if not rows:
             return 0
         with self._connection() as conn:
+            conn.execute("BEGIN")       # one commit, not one per row (autocommit connection)
             conn.executemany(
                 "INSERT INTO prompts (text, bucket, weight, created_at, triggered_at, metadata) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -293,18 +303,65 @@ class Database:
             )
         return ts
 
+    def _index_terms(self, conn: sqlite3.Connection, prompt_id: int, terms: set[str]) -> None:
+        conn.executemany("INSERT OR IGNORE INTO prompt_terms (term, prompt_id) VALUES (?, ?)",
+                         [(t, prompt_id) for t in terms])
+
+    def _ensure_term_index(self) -> None:
+        """Index any reply not yet in prompt_terms (older databases, bulk imports)."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM prompts WHERE id NOT IN (SELECT DISTINCT prompt_id FROM prompt_terms)").fetchall()
+        if not rows:
+            return
+        # Tokens are cached in each row's metadata as they are indexed; all of it
+        # goes in one transaction (one commit per row took most of a minute).
+        updates, indexed = [], []
+        for r in map(dict, rows):
+            meta = json.loads(r.get("metadata") or "{}")
+            if "token_flat_set" not in meta:
+                meta["token_flat_set"] = list(tokenize(r["text"]).as_flat_set())
+                updates.append((json.dumps(meta), r["id"]))
+            indexed.append((r["id"], set(meta["token_flat_set"])))
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            conn.executemany("UPDATE prompts SET metadata = ? WHERE id = ?", updates)
+            for pid, terms in indexed:
+                self._index_terms(conn, pid, terms)
+
     def _update_edges_for(self, new_id: int) -> None:
-        """Compute and store Jaccard edge weights from new_id to all others."""
-        all_rows = self.all_prompts()
-        new_row = next((r for r in all_rows if r["id"] == new_id), None)
+        """
+        Compute and store Jaccard edge weights from new_id to every reply it
+        shares a token with. A pair with no shared token has Jaccard 0 and no
+        edge, so looking only at token-sharing replies (via prompt_terms) finds
+        the same edges as comparing against every reply, at a fraction of the cost.
+        """
+        self._ensure_term_index()
+        new_row = self.get_prompt(new_id)
         if new_row is None:
             return
         ts_new = tokenize(new_row["text"])
+        terms = ts_new.as_flat_set()
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            self._index_terms(conn, new_id, terms)
+            ids: set[int] = set()
+            term_list = list(terms)
+            for i in range(0, len(term_list), 500):
+                chunk = term_list[i:i + 500]
+                q = ",".join("?" * len(chunk))
+                ids.update(r[0] for r in conn.execute(
+                    f"SELECT DISTINCT prompt_id FROM prompt_terms WHERE term IN ({q})", chunk))
+            ids.discard(new_id)
+            candidates: list[dict] = []
+            id_list = list(ids)
+            for i in range(0, len(id_list), 500):
+                chunk = id_list[i:i + 500]
+                q = ",".join("?" * len(chunk))
+                candidates += [dict(r) for r in conn.execute(f"SELECT * FROM prompts WHERE id IN ({q})", chunk)]
 
         edges: list[tuple[int, int, float]] = []
-        for row in all_rows:
-            if row["id"] == new_id:
-                continue
+        for row in candidates:
             ts_other = self._get_cached_tokens(row)
             w = jaccard(ts_new, ts_other)
             if w > 0.0:
@@ -313,6 +370,7 @@ class Database:
 
         if edges:
             with self._connection() as conn:
+                conn.execute("BEGIN")
                 conn.executemany(
                     "INSERT OR REPLACE INTO prompt_edges (src_id, dst_id, weight) "
                     "VALUES (?, ?, ?)",
@@ -397,4 +455,5 @@ class Database:
         """Clear all prompts and edges from the database."""
         with self._connection() as conn:
             conn.execute("DELETE FROM prompt_edges")
+            conn.execute("DELETE FROM prompt_terms")
             conn.execute("DELETE FROM prompts")
