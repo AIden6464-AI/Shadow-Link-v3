@@ -97,6 +97,13 @@ To bootstrap the memory corpus from a Claude.ai export:
 shadow-link ingest-claude-export path\to\conversations.json
 ```
 
+Or from your local coding-agent histories (Claude Code, Codex CLI, Antigravity CLI). It is safe to re-run; it only adds new chats:
+
+```powershell
+shadow-link ingest-sessions
+shadow-link ingest-sessions --only codex agy
+```
+
 ## CLI commands
 
 | Command | What it does |
