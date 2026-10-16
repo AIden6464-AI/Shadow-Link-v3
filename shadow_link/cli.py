@@ -20,6 +20,24 @@ from shadow_link.ingester import Ingester
 from shadow_link.watcher import FileWatcher
 from shadow_link.prompt_wrapper import run_prompt_wrapper
 
+# Shadow Core retires these (docs/SHADOW_CORE_PLAN.md, phase 5). They still work
+# in this release and print what replaces them; they are removed in a later one.
+DEPRECATED = {
+    "ui": "the Shadow sidebar in Claude Code (/shadow) and `shadow-link sessions`",
+    "proxy": "the Claude Code plugin and session tracking (no traffic decryption needed)",
+    "run": "the Claude Code plugin, or `shadow-link connect` for Codex and Antigravity",
+    "watch": "`shadow-link daemon`, which tracks every agent's sessions",
+    "ingest-jsonl": "`shadow-link ingest-sessions`",
+    "ingest-md": "`shadow-link ingest-sessions`",
+    "ingest-human": "`shadow-link ingest-sessions`",
+}
+
+
+def _warn_deprecated(name: str, replacement: str) -> None:
+    print(f"[Shadow Link] `{name}` is deprecated and will be removed in a later release. "
+          f"Use {replacement} instead.", file=sys.stderr)
+
+
 def get_services():
     """Initializes and returns shared config, database, and matcher services."""
     config = Config()
@@ -76,17 +94,126 @@ def handle_ingest_claude_export(args):
 
 def handle_ingest_sessions(args):
     _, _, _, ingester = get_services()
-    sources = tuple(args.only) if args.only else ("claude", "codex", "agy")
+    sources = tuple(args.only) if args.only else ("claude", "codex", "agy", "agy-ide", "opencode", "gemini")
     print(f"Importing reaction pairs from agent CLI histories: {', '.join(sources)}")
     try:
         report = ingester.ingest_agent_sessions(sources)
     except Exception as e:
         print(f"Error during import: {e}", file=sys.stderr)
         sys.exit(1)
-    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI"}
+    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI", "agy-ide": "Antigravity IDE",
+              "opencode": "OpenCode", "gemini": "Gemini CLI"}
     for src, r in report.items():
         print(f"  {labels[src]:<16} {r['sessions']:>4} sessions  {r['imported']:>5} new pairs  "
               f"({r['skipped']} already stored)")
+    _sync_memory()
+
+
+def _sync_memory() -> None:
+    """Mirror new reply pairs into the ACA graph, so there is one memory to ask."""
+    try:
+        from shadow_link.aca import open_aca
+        added = open_aca().store.sync_from_prompts()
+        if added:
+            print(f"  Memory: {added} replies linked into the ACA graph.")
+    except Exception as e:
+        print(f"  Memory sync skipped: {e}", file=sys.stderr)
+
+
+def _ago(ts: float) -> str:
+    import time as _t
+    s = max(0, int(_t.time() - ts))
+    return f"{s // 60}m ago" if s < 3600 else f"{s // 3600}h ago" if s < 86400 else f"{s // 86400}d ago"
+
+
+def handle_sessions(args):
+    from shadow_link.aca.store import CognitiveStore
+    from shadow_link.tracker import SessionStore, SessionTracker
+    config = Config()
+    if args.rebuild:
+        print("Re-reading every agent's session files from the start...")
+        count = None
+        try:   # a running daemon rebuilds itself, so its own copies stay in step
+            import urllib.request
+            port = os.environ.get("SHADOW_LINK_PORT", "5000")
+            req = urllib.request.Request(f"http://localhost:{port}/sessions/rebuild", b"{}",
+                                         {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                count = json.loads(resp.read()).get("sessions")
+        except Exception:
+            count = SessionTracker(config.db_path).rebuild()
+        print(f"Rebuilt {count} session(s).")
+    elif args.scan:
+        SessionTracker(config.db_path).poll_once()
+    items = SessionStore(CognitiveStore(config.db_path)).list(
+        project=args.project or "", agent=args.agent or "", active_only=args.active, limit=args.limit,
+        include_automated=args.all)
+    if not items:
+        print("No agent sessions tracked yet. Run with --scan, or start `shadow-link daemon`.")
+        return
+    for s in items:
+        print(f"{s['id']}  {s['label']:<12} {s['project_name']:<20} {s['state']:<7} {_ago(s['last']):>8}  "
+              f"{s['doing'] or s['goal'][:50]}")
+        if s["open_thread"]:
+            print(f"{'':16}waiting on: {s['open_thread'][:90]}")
+
+
+def handle_handoff(args):
+    from shadow_link.aca.store import CognitiveStore
+    from shadow_link.tracker import build_handoff
+    packet = build_handoff(CognitiveStore(Config().db_path), args.session, args.to or "")
+    if packet is None:
+        print(f"Unknown session '{args.session}'. List them with: shadow-link sessions", file=sys.stderr)
+        sys.exit(1)
+    if args.to_file:
+        out = Path.cwd() / ".shadow" / "handoff.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(packet["markdown"], encoding="utf-8")
+        print(f"Wrote {out}. Point any agent at it to continue.")
+    else:
+        print(packet["markdown"])
+
+
+def handle_forget(args):
+    target = args.target
+    what = f"session {target}" if target.startswith("S-") else f"everything tracked in {Path(target).resolve()}"
+    if not args.yes:
+        confirm = input(f"Forget {what}? This cannot be undone. [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Canceled.")
+            return
+    if not target.startswith("S-"):
+        target = str(Path(target).resolve())
+    out = None
+    try:   # a running daemon must drop its own copies too
+        import urllib.request
+        port = os.environ.get("SHADOW_LINK_PORT", "5000")
+        req = urllib.request.Request(f"http://localhost:{port}/forget", json.dumps({"target": target}).encode(),
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out = json.loads(resp.read())
+    except Exception:
+        from shadow_link.aca.store import CognitiveStore
+        from shadow_link.tracker import SessionStore
+        out = SessionStore(CognitiveStore(Config().db_path)).forget(target)
+    print(f"Forgot {out['sessions']} session(s) ({out['nodes']} memory nodes).")
+
+
+def handle_connect(args):
+    from shadow_link.connect import connect
+    targets = ["codex", "antigravity"] if args.agent == "all" else [args.agent]
+    for line in connect(targets, dry_run=args.dry_run, auto_approve=args.auto_approve):
+        print(line)
+    if not args.dry_run:
+        print("Restart those CLIs, then ask them e.g. \"what is Claude doing? use shadow_sessions\" "
+              "or \"pick up the Claude session with shadow_handoff\".")
+
+
+def handle_reclassify(args):
+    _, db, _, _ = get_services()
+    changed = db.reclassify()
+    print(f"Re-sorted replies with the current categorizer: {changed} changed.")
+    _sync_memory()
 
 def handle_query(args):
     _, _, matcher, _ = get_services()
@@ -199,6 +326,18 @@ def handle_start_api(args):
     watcher.start()
     live_mod.ACTIVE_WATCHER = watcher
 
+    # Shadow Core: one memory, and every agent's sessions tracked into it.
+    _sync_memory()
+    if os.environ.get("SHADOW_TRACK", "1") not in ("0", "false", "False"):
+        import shadow_link.tracker as tracker_mod
+        tracker_mod.TRACKER = tracker_mod.SessionTracker(config.db_path)
+        tracker_mod.TRACKER.start()
+        ignored = tracker_mod.TRACKER.ignored
+        print("[Shadow Link Daemon] Tracking Claude Code, Codex and Antigravity sessions"
+              + (f" (ignoring {len(ignored)} folder(s))" if ignored else "") + "...")
+    else:
+        print("[Shadow Link Daemon] Agent tracking is off (tracking.enabled = false).")
+
     # Start transparent proxy in background if requested
     if getattr(args, "proxy", False):
         from shadow_link.proxy_runtime import PROXY_RUNTIME
@@ -300,17 +439,17 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Ingest JSONL
-    ingest_jsonl_parser = subparsers.add_parser("ingest-jsonl", help="Ingest OGI trace JSONL log")
+    ingest_jsonl_parser = subparsers.add_parser("ingest-jsonl", help="(deprecated) Ingest OGI trace JSONL log")
     ingest_jsonl_parser.add_argument("path", type=Path, help="Path to llm_calls.jsonl")
     ingest_jsonl_parser.set_defaults(func=handle_ingest_jsonl)
 
     # Ingest MD
-    ingest_md_parser = subparsers.add_parser("ingest-md", help="Ingest Markdown prompt log")
+    ingest_md_parser = subparsers.add_parser("ingest-md", help="(deprecated) Ingest Markdown prompt log")
     ingest_md_parser.add_argument("path", type=Path, help="Path to markdown file")
     ingest_md_parser.set_defaults(func=handle_ingest_md)
 
     # Ingest OGI Human Responses
-    ingest_human_parser = subparsers.add_parser("ingest-human", help="Ingest paired OGI human response files")
+    ingest_human_parser = subparsers.add_parser("ingest-human", help="(deprecated) Ingest paired OGI human response files")
     ingest_human_parser.add_argument("path", type=Path, help="Path to OGI intake/state folder")
     ingest_human_parser.set_defaults(func=handle_ingest_human)
 
@@ -321,8 +460,40 @@ def main():
 
     # Agent CLI histories (Claude Code, Codex CLI, Antigravity CLI)
     sessions_parser = subparsers.add_parser("ingest-sessions", help="Import reaction pairs from Claude Code, Codex CLI and Antigravity CLI histories")
-    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy"], help="Limit to these sources")
+    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy", "agy-ide", "opencode", "gemini"], help="Limit to these sources")
     sessions_parser.set_defaults(func=handle_ingest_sessions)
+
+    sess_parser = subparsers.add_parser("sessions", help="List what every coding agent is doing (Claude Code, Codex, Antigravity)")
+    sess_parser.add_argument("--project", help="Only sessions in this project folder")
+    sess_parser.add_argument("--agent", choices=["claude-code", "codex", "antigravity"], help="Only this agent")
+    sess_parser.add_argument("--active", action="store_true", help="Only sessions active in the last 10 minutes")
+    sess_parser.add_argument("--limit", type=int, default=15)
+    sess_parser.add_argument("--scan", action="store_true", help="Read new session activity first (without the daemon)")
+    sess_parser.add_argument("--all", action="store_true", help="Include scripted runs (claude -p, codex exec)")
+    sess_parser.add_argument("--rebuild", action="store_true",
+                             help="Re-read all session files from the start (after an upgrade); keeps model summaries")
+    sess_parser.set_defaults(func=handle_sessions)
+
+    handoff_parser = subparsers.add_parser("handoff", help="Build a handoff brief from one agent session")
+    handoff_parser.add_argument("session", help="Session id from `shadow-link sessions`")
+    handoff_parser.add_argument("--to", help="The agent taking over (recorded with the handoff)")
+    handoff_parser.add_argument("--to-file", action="store_true", help="Write .shadow/handoff.md in the current folder")
+    handoff_parser.set_defaults(func=handle_handoff)
+
+    forget_parser = subparsers.add_parser("forget", help="Remove a tracked session, or everything tracked in a project folder")
+    forget_parser.add_argument("target", help="A session id (S-...) from `shadow-link sessions`, or a project folder")
+    forget_parser.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    forget_parser.set_defaults(func=handle_forget)
+
+    connect_parser = subparsers.add_parser("connect", help="Give Codex / Antigravity Shadow's MCP tools (sessions, recall, handoff)")
+    connect_parser.add_argument("agent", nargs="?", default="all", choices=["all", "codex", "antigravity"])
+    connect_parser.add_argument("--dry-run", action="store_true", help="Show the change without writing it")
+    connect_parser.add_argument("--auto-approve", action="store_true",
+                                help="Let Codex call Shadow's tools without asking each time (off by default)")
+    connect_parser.set_defaults(func=handle_connect)
+
+    reclassify_parser = subparsers.add_parser("reclassify", help="Re-sort stored replies with the current categorizer")
+    reclassify_parser.set_defaults(func=handle_reclassify)
 
     # Query Matcher
     query_parser = subparsers.add_parser("query", help="Query the hybrid matcher for predictions")
@@ -332,7 +503,7 @@ def main():
     query_parser.set_defaults(func=handle_query)
 
     # Directory Watcher
-    watch_parser = subparsers.add_parser("watch", help="Watch a directory for question files")
+    watch_parser = subparsers.add_parser("watch", help="(deprecated) Watch a directory for question files")
     watch_parser.add_argument("dir", type=Path, help="Directory to monitor")
     watch_parser.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval in seconds")
     watch_parser.add_argument("--auto-approve", type=float, default=0.90, help="Confidence threshold to auto-reply")
@@ -361,17 +532,17 @@ def main():
     api_parser = subparsers.add_parser("daemon", help="Start the API + watcher background daemon")
     api_parser.add_argument("--host", type=str, default=cfg_host, help="Host interface to bind to")
     api_parser.add_argument("--port", type=int, default=cfg_port, help="Port number to listen on")
-    api_parser.add_argument("--proxy", action="store_true", help="Start transparent proxy in background")
+    api_parser.add_argument("--proxy", action="store_true", help="(deprecated) Start transparent proxy in background")
     api_parser.add_argument("--proxy-port", type=int, default=cfg_proxy_port, help="Port number for background proxy")
     api_parser.set_defaults(func=handle_start_api)
 
     # Start Proxy command (foreground)
-    proxy_parser = subparsers.add_parser("proxy", help="Start the integrated transparent MITM proxy")
+    proxy_parser = subparsers.add_parser("proxy", help="(deprecated) Start the integrated transparent MITM proxy")
     proxy_parser.add_argument("--port", type=int, default=cfg_proxy_port, help="Port to listen on")
     proxy_parser.set_defaults(func=handle_proxy)
 
     # Run Subprocess command
-    run_parser = subparsers.add_parser("run", help="Run a CLI agent interactively with inline completions")
+    run_parser = subparsers.add_parser("run", help="(deprecated) Run a CLI agent interactively with inline completions")
     run_parser.add_argument("cmd", nargs="+", help="Command to run (e.g. shadow-link run antigravity-cli)")
     run_parser.set_defaults(func=handle_run)
 
@@ -389,10 +560,14 @@ def main():
     aca_parser.set_defaults(func=handle_aca)
 
     # TUI command
-    ui_parser = subparsers.add_parser("ui", help="Start the interactive terminal user interface dashboard")
+    ui_parser = subparsers.add_parser("ui", help="(deprecated) Start the interactive terminal user interface dashboard")
     ui_parser.set_defaults(func=handle_tui)
 
     args = parser.parse_args()
+    if args.command in DEPRECATED:
+        _warn_deprecated(args.command, DEPRECATED[args.command])
+    if args.command == "daemon" and getattr(args, "proxy", False):
+        _warn_deprecated("daemon --proxy", DEPRECATED["proxy"])
     args.func(args)
 
 if __name__ == "__main__":

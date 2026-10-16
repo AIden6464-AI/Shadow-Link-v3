@@ -104,6 +104,13 @@ def apply_config_json(root_dir: Path | None = None) -> dict:
     if "learn" in proxy:
         setenv("SHADOW_LINK_LEARN", _flag(bool(proxy["learn"]), "true", "false"))
 
+    tracking = data.get("tracking", {})
+    if "enabled" in tracking:
+        setenv("SHADOW_TRACK", _flag(bool(tracking["enabled"]), "1", "0"))
+    if tracking.get("ignore"):
+        setenv("SHADOW_TRACK_IGNORE", ";".join(str(p) for p in tracking["ignore"]))
+    setenv("SHADOW_TRACK_KEEP_DAYS", tracking.get("keep_activity_days"))
+
     return data
 
 def load_dotenv(env_path: Path):

@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS prompt_vectors (
     FOREIGN KEY (prompt_id) REFERENCES prompts(id)
 );
 
+-- Which replies contain which tokens, so a new reply is compared only with
+-- replies it shares a token with (see _update_edges_for).
+CREATE TABLE IF NOT EXISTS prompt_terms (
+    term      TEXT    NOT NULL,
+    prompt_id INTEGER NOT NULL,
+    PRIMARY KEY (term, prompt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_terms_prompt ON prompt_terms(prompt_id);
+
 CREATE INDEX IF NOT EXISTS idx_prompts_bucket    ON prompts(bucket);
 CREATE INDEX IF NOT EXISTS idx_prompts_weight    ON prompts(weight DESC);
 CREATE INDEX IF NOT EXISTS idx_edges_src         ON prompt_edges(src_id);
@@ -100,14 +109,16 @@ class Database:
         """
         Leak-proof connection context manager.
         """
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         try:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -151,28 +162,38 @@ class Database:
         DUPLICATE_WINDOW_SECONDS). Short replies such as "continue" sent to
         different situations stay separate pairs. Returns (id, created).
         """
+        if bucket not in BUCKETS:
+            raise ValueError(f"Unknown bucket '{bucket}'. Valid: {BUCKETS}")
         text = text.strip()
         meta = metadata or {}
         situation = _norm_situation(meta)
         now = time.time()
+        # The hook process, the plugin, the proxy and the watcher can capture the
+        # same reply at once: look and insert under one write lock so only one wins.
         with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT id, created_at, metadata FROM prompts WHERE text = ? ORDER BY id DESC LIMIT 50",
                 (text,),
             ).fetchall()
-        for r in rows:
-            try:
-                other = json.loads(r["metadata"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                other = {}
-            other_situation = _norm_situation(other)
-            if situation and other_situation:
-                duplicate = _same_situation(situation, other_situation)
-            else:
-                duplicate = now - float(r["created_at"]) <= DUPLICATE_WINDOW_SECONDS
-            if duplicate:
-                return int(r["id"]), False
-        return self.add_prompt(text, bucket, weight, meta), True
+            for r in rows:
+                try:
+                    other = json.loads(r["metadata"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    other = {}
+                other_situation = _norm_situation(other)
+                if situation and other_situation:
+                    duplicate = _same_situation(situation, other_situation)
+                else:
+                    duplicate = now - float(r["created_at"]) <= DUPLICATE_WINDOW_SECONDS
+                if duplicate:
+                    return int(r["id"]), False
+            new_id = conn.execute(
+                "INSERT INTO prompts (text, bucket, weight, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
+                (text, bucket, weight, now, json.dumps(meta)),
+            ).lastrowid
+        self._update_edges_for(new_id)
+        return int(new_id), True
 
     def get_prompt(self, prompt_id: int) -> dict | None:
         with self._connection() as conn:
@@ -259,6 +280,7 @@ class Database:
         if not rows:
             return 0
         with self._connection() as conn:
+            conn.execute("BEGIN")       # one commit, not one per row (autocommit connection)
             conn.executemany(
                 "INSERT INTO prompts (text, bucket, weight, created_at, triggered_at, metadata) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -281,18 +303,65 @@ class Database:
             )
         return ts
 
+    def _index_terms(self, conn: sqlite3.Connection, prompt_id: int, terms: set[str]) -> None:
+        conn.executemany("INSERT OR IGNORE INTO prompt_terms (term, prompt_id) VALUES (?, ?)",
+                         [(t, prompt_id) for t in terms])
+
+    def _ensure_term_index(self) -> None:
+        """Index any reply not yet in prompt_terms (older databases, bulk imports)."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM prompts WHERE id NOT IN (SELECT DISTINCT prompt_id FROM prompt_terms)").fetchall()
+        if not rows:
+            return
+        # Tokens are cached in each row's metadata as they are indexed; all of it
+        # goes in one transaction (one commit per row took most of a minute).
+        updates, indexed = [], []
+        for r in map(dict, rows):
+            meta = json.loads(r.get("metadata") or "{}")
+            if "token_flat_set" not in meta:
+                meta["token_flat_set"] = list(tokenize(r["text"]).as_flat_set())
+                updates.append((json.dumps(meta), r["id"]))
+            indexed.append((r["id"], set(meta["token_flat_set"])))
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            conn.executemany("UPDATE prompts SET metadata = ? WHERE id = ?", updates)
+            for pid, terms in indexed:
+                self._index_terms(conn, pid, terms)
+
     def _update_edges_for(self, new_id: int) -> None:
-        """Compute and store Jaccard edge weights from new_id to all others."""
-        all_rows = self.all_prompts()
-        new_row = next((r for r in all_rows if r["id"] == new_id), None)
+        """
+        Compute and store Jaccard edge weights from new_id to every reply it
+        shares a token with. A pair with no shared token has Jaccard 0 and no
+        edge, so looking only at token-sharing replies (via prompt_terms) finds
+        the same edges as comparing against every reply, at a fraction of the cost.
+        """
+        self._ensure_term_index()
+        new_row = self.get_prompt(new_id)
         if new_row is None:
             return
         ts_new = tokenize(new_row["text"])
+        terms = ts_new.as_flat_set()
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            self._index_terms(conn, new_id, terms)
+            ids: set[int] = set()
+            term_list = list(terms)
+            for i in range(0, len(term_list), 500):
+                chunk = term_list[i:i + 500]
+                q = ",".join("?" * len(chunk))
+                ids.update(r[0] for r in conn.execute(
+                    f"SELECT DISTINCT prompt_id FROM prompt_terms WHERE term IN ({q})", chunk))
+            ids.discard(new_id)
+            candidates: list[dict] = []
+            id_list = list(ids)
+            for i in range(0, len(id_list), 500):
+                chunk = id_list[i:i + 500]
+                q = ",".join("?" * len(chunk))
+                candidates += [dict(r) for r in conn.execute(f"SELECT * FROM prompts WHERE id IN ({q})", chunk)]
 
         edges: list[tuple[int, int, float]] = []
-        for row in all_rows:
-            if row["id"] == new_id:
-                continue
+        for row in candidates:
             ts_other = self._get_cached_tokens(row)
             w = jaccard(ts_new, ts_other)
             if w > 0.0:
@@ -301,6 +370,7 @@ class Database:
 
         if edges:
             with self._connection() as conn:
+                conn.execute("BEGIN")
                 conn.executemany(
                     "INSERT OR REPLACE INTO prompt_edges (src_id, dst_id, weight) "
                     "VALUES (?, ?, ?)",
@@ -361,8 +431,29 @@ class Database:
             edges = conn.execute("SELECT COUNT(*) FROM prompt_edges").fetchone()[0]
         return {"total_prompts": total, "by_bucket": by_bucket, "total_edges": edges}
 
+    def reclassify(self) -> int:
+        """Re-run the categorizer over every stored reply; returns rows changed."""
+        from shadow_link.ingester import classify_multi
+        changed = 0
+        with self._connection() as conn:
+            rows = conn.execute("SELECT id, text, bucket, metadata FROM prompts").fetchall()
+            for r in rows:
+                try:
+                    meta = json.loads(r["metadata"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+                buckets = classify_multi(r["text"])
+                if buckets[0] == r["bucket"] and meta.get("buckets") == buckets:
+                    continue
+                meta["buckets"] = buckets
+                conn.execute("UPDATE prompts SET bucket = ?, metadata = ? WHERE id = ?",
+                             (buckets[0], json.dumps(meta), r["id"]))
+                changed += 1
+        return changed
+
     def clear(self) -> None:
         """Clear all prompts and edges from the database."""
         with self._connection() as conn:
             conn.execute("DELETE FROM prompt_edges")
+            conn.execute("DELETE FROM prompt_terms")
             conn.execute("DELETE FROM prompts")

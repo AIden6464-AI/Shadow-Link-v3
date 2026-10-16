@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ShadowAlt, ShadowAnswer, ShadowGhost, ShadowStats, ShadowWhy } from '../types'
+import type { ShadowAgent, ShadowAlt, ShadowAnswer, ShadowGhost, ShadowStats, ShadowThread, ShadowWhy } from '../types'
 
 // Shadow lives in a sidebar beside the conversation. After every Claude turn it
 // asks the local Shadow Link daemon how you would likely reply, shows that as a
@@ -21,6 +21,10 @@ const waitingAtom = atom({ plugin: 'shadow-link', key: 'isWaiting' } as const, f
 const statsAtom = atom({ plugin: 'shadow-link', key: 'stats' } as const, { corpus: null, learned: 0 } as ShadowStats)
 const recentAtom = atom({ plugin: 'shadow-link', key: 'recent' } as const, [] as string[])
 const draftingAtom = atom({ plugin: 'shadow-link', key: 'isDrafting' } as const, false)
+const agentsAtom = atom({ plugin: 'shadow-link', key: 'agents' } as const, [] as ShadowAgent[])
+const threadsAtom = atom({ plugin: 'shadow-link', key: 'threads' } as const, [] as ShadowThread[])
+const openAgentAtom = atom({ plugin: 'shadow-link', key: 'openAgent' } as const, null as string | null)
+const problemsAtom = atom({ plugin: 'shadow-link', key: 'problems' } as const, {} as Record<string, string>)
 
 // The Shadow Link terminal palette (docs/brand.md, shadow_link/tui.py).
 const THEME = {
@@ -43,6 +47,10 @@ let cfg = { baseUrl: 'http://localhost:5000', minConfidence: 0.08, suggestInProm
 const DRAFTED = 'drafted'
 // The sidebar opens itself once per load, and only where it docks beside the transcript.
 let hasAutoOpened = false
+// This session, so the AGENTS list shows the other agents' work, not its own.
+let session = { id: '', cwd: '' }
+let isDigesting = false
+const AGENTS_REFRESH_MS = 15000
 
 async function call($: EngineInterface, method: 'GET' | 'POST', path: string, body?: unknown): Promise<any | null> {
   let res
@@ -89,7 +97,8 @@ const toAlt = (raw: any): ShadowAlt | null =>
 async function refreshStats($: EngineInterface) {
   const data = await call($, 'GET', '/stats')
   if (data && typeof data.total_prompts === 'number') {
-    await update($, statsAtom, s => ({ ...s, corpus: data.total_prompts }))
+    const bytes = typeof data.database_bytes === 'number' ? data.database_bytes : null
+    await update($, statsAtom, s => ({ ...s, corpus: data.total_prompts, bytes }))
   }
 }
 
@@ -234,12 +243,18 @@ async function ask($: EngineInterface, question: string) {
         : `- (${i.type}) ${String(i.content ?? '').slice(0, 300)}`)
     .join('\n')
 
+  const agents = await read($, agentsAtom)
+  const others = agentsContext(agents)
+  const timelines = await namedTimelines($, q, agents)
+
   const prompt = [
     'This is a side question from the user to Shadow, a separate assistant watching this session.',
     'Answer as Shadow, not as Claude: refer to Claude in the third person ("Claude tried…"),',
     'address the user as "you", and use at most 4 short sentences. Do not continue the task',
     'and do not call tools.',
     recalled ? `\nWhat Shadow Link remembers about this user:\n${recalled}` : '',
+    others ? `\nWhat Shadow has seen the user's other coding agents doing:\n${others}` : '',
+    timelines ? `\nDetail for the sessions this question is about:\n${timelines}` : '',
     `\nQuestion: ${q}`,
   ].join('\n')
 
@@ -259,6 +274,145 @@ async function ask($: EngineInterface, question: string) {
   await update($, answerAtom, () => ({ question: q, text, isPending: false }))
 }
 
+// ------------------------------------------------------------ other agents
+const ago = (ts: number) => {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts))
+  return s < 60 ? 'now' : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`
+}
+
+const toAgent = (s: any): ShadowAgent => ({
+  id: String(s.id),
+  label: String(s.label ?? s.agent ?? 'agent'),
+  projectName: String(s.project_name ?? ''),
+  state: s.state === 'active' || s.state === 'idle' ? s.state : 'ended',
+  doing: String(s.doing ?? ''),
+  goal: String(s.goal ?? ''),
+  openThread: String(s.open_thread ?? ''),
+  last: Number(s.last ?? 0),
+  digest: String(s.digest ?? ''),
+  needsDigest: Boolean(s.needs_digest),
+})
+
+async function refreshAgents($: EngineInterface) {
+  const q = session.id ? `&exclude=${encodeURIComponent(session.id)}` : ''
+  const data = await call($, 'GET', `/sessions?limit=8${q}`)
+  if (!data || !Array.isArray(data.sessions)) return
+  const agents = data.sessions.map(toAgent)
+  await update($, agentsAtom, () => agents)
+  const problems = data.problems && typeof data.problems === 'object' ? data.problems : {}
+  await update($, problemsAtom, () => Object.fromEntries(Object.entries(problems).map(([k, v]) => [k, String(v)])))
+  const t = await call($, 'GET', `/threads?project=${encodeURIComponent(session.cwd)}`)
+  if (t && Array.isArray(t.threads)) {
+    await update($, threadsAtom, () => t.threads
+      .filter((x: any) => x.session && !agents.every((a: ShadowAgent) => a.id !== x.session))
+      .slice(0, 4)
+      .map((x: any) => ({ session: String(x.session), agent: String(x.agent), projectName: String(x.project_name ?? ''), text: String(x.text ?? '') })))
+  }
+  await digestOne($, agents).catch(() => undefined)
+}
+
+const DIGEST_SYSTEM = [
+  'You summarise one coding-agent session for the developer who ran it.',
+  'Answer in exactly this shape:',
+  'SUMMARY: 2 or 3 short plain sentences on what was being worked on, where it stands now, and what is left or blocked.',
+  'DECISIONS: one line per decision the developer made (a choice, a rule, a direction), each starting "- ", written so it',
+  'makes sense on its own (e.g. "- Use Haiku to draft replies, not a local model"). Write "DECISIONS: none" if there were none.',
+  'Only list what the developer decided, never what the agent proposed and was not confirmed.',
+].join('\n')
+
+/** Split the model's digest into the summary and the decisions it found. */
+function parseDigest(raw: string): { summary: string; decisions: string[] } {
+  const text = raw.trim().replace(/^["'“]+|["'”]+$/g, '').trim()
+  const [head, tail = ''] = text.split(/^\s*DECISIONS:/im)
+  const summary = head.replace(/^\s*SUMMARY:\s*/i, '').trim()
+  const decisions = /^\s*none\b/i.test(tail)
+    ? []
+    : tail.split('\n').map(l => l.trim()).filter(l => l.startsWith('-')).map(l => l.replace(/^-\s*/, '').trim()).filter(Boolean)
+  return { summary: summary || text.trim(), decisions: decisions.slice(0, 8) }
+}
+
+/** Quiet sessions get a model-written summary in place of the template (one at a time). */
+async function digestOne($: EngineInterface, agents: ShadowAgent[]) {
+  if (isDigesting || cfg.ghostModel === 'off') return
+  const target = agents.find(a => a.needsDigest && a.state === 'idle')
+  if (!target) return
+  isDigesting = true
+  try {
+    const detail = await call($, 'GET', `/sessions/${encodeURIComponent(target.id)}`)
+    const rec = detail?.record
+    if (!rec) return
+    const files = Object.keys(rec.files ?? {}).slice(-12).join(', ')
+    const cmds = (rec.commands ?? []).slice(-6).map((c: any) => `${c.cmd}${c.status === 'error' ? ' (failed)' : ''}`).join('\n')
+    const prompt = [
+      `Agent: ${target.label}. Project: ${target.projectName}.`,
+      `Goal: ${rec.goal}`,
+      rec.requests?.length ? `Requests, oldest first:\n${rec.requests.map((r: string) => `- ${clip(r, 200)}`).join('\n')}` : '',
+      files ? `Files changed: ${files}` : '',
+      cmds ? `Recent commands:\n${cmds}` : '',
+      rec.errors?.length ? `Errors: ${rec.errors.map((e: any) => e.what).join('; ')}` : '',
+      rec.last_agent ? `The agent's last reply:\n${clip(rec.last_agent, 800)}` : '',
+      rec.open_thread ? `It is waiting on: ${rec.open_thread}` : '',
+    ].filter(Boolean).join('\n\n')
+    const r = await $.model.complete({ model: cfg.ghostModel, system: DIGEST_SYSTEM, prompt, maxTokens: 320, timeoutMs: 20000 })
+    if (r.isAnswered && r.text.trim()) {
+      const { summary, decisions } = parseDigest(r.text)
+      await post($, `/sessions/${encodeURIComponent(target.id)}/digest`, { text: summary, by: cfg.ghostModel, decisions })
+      await update($, agentsAtom, list => list.map(a => (a.id === target.id ? { ...a, digest: summary, needsDigest: false } : a)))
+    }
+  } finally {
+    isDigesting = false
+  }
+}
+
+/** Build a handoff brief from another agent's session and put it in the chat bar to send. */
+async function handOver($: EngineInterface, sessionId: string): Promise<boolean> {
+  const packet = await post($, '/handoff', { session: sessionId, to_agent: 'claude-code' })
+  if (!packet || typeof packet.markdown !== 'string') {
+    $.ui.toast('Shadow could not build that handoff')
+    return false
+  }
+  await useGhost($, packet.markdown)
+  $.ui.toast(`Handoff from ${packet.from_label ?? 'the agent'} is in the chat bar: send it to continue`)
+  return true
+}
+
+/** The full timeline of up to two sessions the question names (by agent or project). */
+async function namedTimelines($: EngineInterface, question: string, agents: ShadowAgent[]) {
+  const q = question.toLowerCase()
+  const named = agents.filter(a =>
+    q.includes(a.label.toLowerCase()) || (a.projectName && q.includes(a.projectName.toLowerCase())))
+  const parts: string[] = []
+  for (const a of named.slice(0, 2)) {
+    const d = await call($, 'GET', `/sessions/${encodeURIComponent(a.id)}`)
+    const rec = d?.record
+    if (!rec) continue
+    const files = Object.entries(rec.files ?? {})
+      .sort((x: any, y: any) => y[1].last - x[1].last).slice(0, 10)
+      .map(([f, i]: any) => `${f} (${i.edits}x)`)
+    parts.push([
+      `${a.label} in ${a.projectName} (${a.state}, last active ${ago(a.last)} ago)`,
+      `  goal: ${clip(rec.goal ?? '', 200)}`,
+      rec.requests?.length ? `  requests: ${rec.requests.map((r: string) => clip(r, 140)).join(' | ')}` : '',
+      files.length ? `  files changed: ${files.join(', ')}` : '',
+      rec.commands?.length ? `  commands: ${rec.commands.slice(-6).map((c: any) => `${clip(c.cmd, 80)}${c.status === 'error' ? ' (failed)' : ''}`).join(' | ')}` : '',
+      rec.tests?.length ? `  last tests: ${rec.tests[rec.tests.length - 1].status === 'ok' ? 'passed' : 'failed'}` : '',
+      rec.errors?.length ? `  errors: ${rec.errors.map((e: any) => clip(e.what, 80)).join(' | ')}` : '',
+      rec.decisions?.length ? `  decisions: ${rec.decisions.map((x: any) => clip(x.text, 120)).join(' | ')}` : '',
+      rec.digest ? `  summary: ${clip(rec.digest, 400)}` : '',
+      rec.open_thread ? `  waiting on: ${rec.open_thread}` : '',
+    ].filter(Boolean).join('\n'))
+  }
+  return parts.join('\n')
+}
+
+/** What Shadow has seen the other agents doing, for side questions. */
+function agentsContext(agents: ShadowAgent[]) {
+  return agents.slice(0, 6).map(a =>
+    `- ${a.label} in ${a.projectName || 'an unknown folder'} (${a.state}, ${ago(a.last)} ago): ${a.goal ? `goal "${clip(a.goal, 120)}"` : 'no goal recorded'}` +
+    `${a.doing ? `; last ${a.doing}` : ''}${a.digest ? `; ${clip(a.digest.replace(/\s+/g, ' '), 240)}` : ''}${a.openThread ? `; waiting on "${clip(a.openThread, 120)}"` : ''}`,
+  ).join('\n')
+}
+
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Shadow', columns: 38 })
 
 export const register: Register = (on, options) => {
@@ -274,9 +428,12 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'shadow',
-      description: 'Open the Shadow sidebar, `/shadow <question>` to ask about this session, `/shadow status` to check the daemon.',
+      description: 'Open the Shadow sidebar, `/shadow <question>` to ask, `/shadow handoff <codex|antigravity|session id>` to continue another agent\'s work, `/shadow status`.',
     })
     void refreshStats($).catch(() => undefined)
+    session = { id: await $.session.id().catch(() => ''), cwd: e.cwd }
+    void refreshAgents($).catch(() => undefined)
+    $.clock.every(AGENTS_REFRESH_MS, () => refreshAgents($).catch(() => undefined))
     return next(e)
   })
 
@@ -285,6 +442,20 @@ export const register: Register = (on, options) => {
     if (args === 'status') {
       const online = await read($, onlineAtom)
       return { text: online ? `Shadow is linked to ${cfg.baseUrl}.` : `Shadow can't reach ${cfg.baseUrl}. Run: shadow-link daemon` }
+    }
+    const handoff = /^handoff\b\s*(.*)$/i.exec(args)
+    if (handoff) {
+      await refreshAgents($)
+      const want = handoff[1].trim().toLowerCase()
+      const agents = await read($, agentsAtom)
+      const pick = agents.find(a => a.id.toLowerCase() === want)
+        ?? agents.find(a => want && (a.label.toLowerCase().includes(want) || a.id.includes(want)))
+        ?? (want ? undefined : agents[0])
+      if (!pick) {
+        return { text: want ? `Shadow has no recent session matching "${want}". Run /shadow to see the AGENTS list.` : 'Shadow has not seen another agent working yet.' }
+      }
+      const ok = await handOver($, pick.id)
+      return { text: ok ? `Handoff from ${pick.label} (${pick.projectName}) is in the chat bar.` : 'Shadow could not build that handoff.' }
     }
     await openPane($)
     if (!args || args === 'open') return { text: 'Shadow sidebar open.' }
@@ -304,6 +475,8 @@ export const register: Register = (on, options) => {
         await update($, situationAtom, () => e.answer)
         await predict($, e.answer)
       }
+      // After the ghost, so the guess never waits on the agents list.
+      await refreshAgents($).catch(() => undefined)
     }
     return result
   })
@@ -479,6 +652,71 @@ export const register: Register = (on, options) => {
       </Box>
     ) : null
 
+    const agents = await read($, agentsAtom)
+    const threads = await read($, threadsAtom)
+    const openAgent = await read($, openAgentAtom)
+    const dot = (s: ShadowAgent['state']) => (s === 'active' ? THEME.signal : s === 'idle' ? THEME.warn : THEME.muted)
+    // What agents are doing now: current sessions first; ended ones (over a day
+    // quiet) only as a short "earlier" list when nothing is current.
+    const liveAgents = agents.filter(a => a.state !== 'ended')
+    const isEarlier = liveAgents.length === 0
+    const shown = (isEarlier ? agents.slice(0, 3) : liveAgents).slice(0, isDocked ? 5 : 2)
+    // A raw command says little about the work; the file being edited or the goal says more.
+    const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim()
+    const summaryLine = (a: ShadowAgent) =>
+      oneLine(a.doing.startsWith('editing ') ? a.doing : a.goal ? `goal: ${a.goal}` : a.doing)
+    const problems = Object.entries(await read($, problemsAtom))
+    const agentsSection = online ? (
+      <Box key="agents" flexDirection="column">
+        {section('agents-head', 'AGENTS')}
+        {problems.map(([agent, why], i) => (
+          <Text key={`problem-${i}`} color={THEME.warn} wrap="wrap">{'  '}can't read {agent}: {clip(why, 120)}</Text>
+        ))}
+        {shown.length === 0 ? (
+          <Text key="agents-none" color={THEME.muted} wrap="wrap">No other agent sessions yet. Codex and Antigravity show up here as they work.</Text>
+        ) : null}
+        {isEarlier && shown.length ? (
+          <Text key="agents-earlier" color={THEME.muted}>{'  '}nothing running now · earlier:</Text>
+        ) : null}
+        {shown.length === 0 ? null : (
+          shown.map((a, i) => (
+            <Box key={`agent-${i}`} flexDirection="column">
+              <Text key="row" wrap="truncate-end">
+                <Text color={dot(a.state)}>●</Text> <Text color={THEME.text} bold>{a.label}</Text>
+                <Text color={THEME.muted}> · {a.projectName} · {ago(a.last)}</Text>
+              </Text>
+              <Text key="doing" color={THEME.muted} wrap="truncate-end">{'  '}{clip(summaryLine(a), width * 2)}</Text>
+              {openAgent === a.id ? (
+                <Box key="detail" flexDirection="column">
+                  {a.goal && summaryLine(a) !== `goal: ${a.goal}` ? <Text key="goal" color={THEME.text} wrap="wrap">{'  '}goal: {clip(a.goal, 200)}</Text> : null}
+                  {a.doing && a.doing !== summaryLine(a) ? <Text key="last" color={THEME.muted} wrap="wrap">{'  '}last: {clip(a.doing, 120)}</Text> : null}
+                  {a.digest ? <Text key="digest" color={THEME.text} wrap="wrap">{'  '}{clip(a.digest, 500)}</Text> : null}
+                  {a.openThread ? <Text key="waiting" color={THEME.warn} wrap="wrap">{'  '}waiting on: {a.openThread}</Text> : null}
+                </Box>
+              ) : null}
+              <Box key="acts" flexDirection="row" columnGap={1}>
+                <Text key="pad">{' '}</Text>
+                <Button key={`open-${i}`} label={openAgent === a.id ? 'less' : 'open'}
+                  onPress={() => update($, openAgentAtom, cur => (cur === a.id ? null : a.id))} />
+                <Button key={`handover-${i}`} label="hand over" onPress={() => handOver($, a.id)} />
+              </Box>
+            </Box>
+          ))
+        )}
+      </Box>
+    ) : null
+
+    const threadsSection = isDocked && threads.length ? (
+      <Box key="threads" flexDirection="column">
+        {section('threads-head', 'OPEN THREADS')}
+        {threads.map((t, i) => (
+          <Text key={`thread-${i}`} color={THEME.text} wrap="wrap">
+            {'  '}• {clip(t.text, 160)} <Text color={THEME.muted}>({t.agent})</Text>
+          </Text>
+        ))}
+      </Box>
+    ) : null
+
     const askSection = (
       <Box key="ask-section" flexDirection="column">
         {section('ask-head', 'ASK SHADOW')}
@@ -511,6 +749,11 @@ export const register: Register = (on, options) => {
             {isDocked ? '  ' : ''}{stats.learned} <Text color={THEME.muted}>this session</Text>
           </Text>
         ) : null}
+        {isDocked && stats.bytes ? (
+          <Text key="memory-size" color={THEME.text}>
+            {'  '}{(stats.bytes / 1048576).toFixed(1)} MB <Text color={THEME.muted}>on disk</Text>
+          </Text>
+        ) : null}
       </Box>
     )
 
@@ -522,6 +765,8 @@ export const register: Register = (on, options) => {
           {ghostKeys}
         </Box>
         {whySection}
+        {agentsSection}
+        {threadsSection}
         {askSection}
         {memory}
       </Box>

@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
 from shadow_link.database import Database, BUCKETS
 from shadow_link.tokenizer import tokenize
 
+# Matched as whole words or phrases ("bad" never matches "badge"). Asking for
+# something to be removed or cleaned up is a request, not a rejection, so those
+# verbs are not here.
 KEYWORDS_REJECTION = {
-    "too bloated", "bloated", "strip", "wipe", "boilerplate", "remove", 
-    "clean", "cliché", "corporate jargon", "bad", "wrong", "revert", "delete",
-    "stop writing", "don't need", "unnecessary"
+    "too bloated", "bloated", "boilerplate", "cliché", "corporate jargon", "bad",
+    "wrong", "revert", "undo", "stop writing", "don't need", "unnecessary", "overkill",
 }
 
 KEYWORDS_REMINDER = {
@@ -43,6 +45,17 @@ _NEGATION_RE = re.compile(
     r"\b(?:do not|don't|dont|does not|doesn't|never|avoid|stop using|no need)\b")
 
 
+def _phrase_re(words: set[str]) -> re.Pattern:
+    alts = sorted((re.escape(w) for w in words), key=len, reverse=True)
+    return re.compile(r"(?<![\w'])(?:" + "|".join(alts) + r")(?![\w'])")
+
+
+_REJECTION_RE = _phrase_re(KEYWORDS_REJECTION)
+_CORRECTION_RE = _phrase_re(KEYWORDS_CORRECTION)
+_PIVOT_RE = _phrase_re(KEYWORDS_PIVOT)
+_REMINDER_RE = _phrase_re(KEYWORDS_REMINDER)
+
+
 def classify_by_heuristics(text: str) -> str:
     """Helper to classify text into a single primary bucket based on keywords."""
     return classify_multi(text)[0]
@@ -53,13 +66,13 @@ def classify_multi(text: str) -> list[str]:
     """
     text_lower = text.lower()
     hits: list[str] = []
-    if any(kw in text_lower for kw in KEYWORDS_REJECTION) or _NEGATION_RE.search(text_lower):
+    if _REJECTION_RE.search(text_lower) or _NEGATION_RE.search(text_lower):
         hits.append("rejection")
-    if any(kw in text_lower for kw in KEYWORDS_CORRECTION):
+    if _CORRECTION_RE.search(text_lower):
         hits.append("correction")
-    if any(kw in text_lower for kw in KEYWORDS_PIVOT):
+    if _PIVOT_RE.search(text_lower):
         hits.append("pivot")
-    if any(kw in text_lower for kw in KEYWORDS_REMINDER):
+    if _REMINDER_RE.search(text_lower):
         hits.append("reminder")
     return hits or ["request"]
 
@@ -121,7 +134,7 @@ class Ingester:
                 continue
 
             metadata = {"source": "markdown_import", "file": filepath.name}
-            timestamp = datetime.utcnow().isoformat() + "Z"
+            timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
             
             self._process_and_store(
                 content=block,
@@ -148,7 +161,7 @@ class Ingester:
 
                 try:
                     data = json.loads(line)
-                    ts = data.get("ts", datetime.utcnow().isoformat() + "Z")
+                    ts = data.get("ts", datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z")
                     req = data.get("request", {})
                     messages = req.get("messages", [])
 
@@ -201,7 +214,7 @@ class Ingester:
                     r_text = r_file.read_text(encoding="utf-8").strip()
 
                     mtime = r_file.stat().st_mtime
-                    ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
+                    ts = datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None).isoformat() + "Z"
 
                     metadata = {
                         "source": "oneiros_human_history",
@@ -314,7 +327,9 @@ class Ingester:
         from shadow_link.live import clean_reply, is_real_reply
 
         home = Path(home) if home else Path.home()
-        readers = {"claude": _claude_code_sessions, "codex": _codex_sessions, "agy": _antigravity_sessions}
+        readers = {"claude": _claude_code_sessions, "codex": _codex_sessions, "agy": _antigravity_sessions,
+                   "agy-ide": _antigravity_ide_sessions, "opencode": _opencode_sessions,
+                   "gemini": _gemini_sessions}
 
         existing: set[tuple[str, str]] = set()
         for r in self.db.all_prompts():
@@ -370,7 +385,7 @@ class Ingester:
         if not is_real_reply(response):
             return None
         response = clean_reply(response)
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
         metadata = {
             "source": "oneiros_live_ingest",
             "request_id": request_id,
@@ -466,8 +481,66 @@ def _codex_sessions(home: Path):
 _AGY_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 
 
-def _antigravity_sessions(home: Path):
-    root = home / ".gemini" / "antigravity-cli" / "brain"
+def _opencode_sessions(home: Path):
+    """OpenCode's SQLite store: only the session, message and part tables are read."""
+    import sqlite3
+    db = home / ".local" / "share" / "opencode" / "opencode.db"
+    if not db.exists():
+        return
+    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        sessions = [r["id"] for r in conn.execute("SELECT id FROM session WHERE parent_id IS NULL ORDER BY time_created")]
+        for sid in sessions:
+            turns = []
+            rows = conn.execute(
+                "SELECT m.id AS mid, m.data AS mdata, p.data AS pdata, p.time_created AS t"
+                "  FROM message m JOIN part p ON p.message_id = m.id"
+                " WHERE m.session_id = ? ORDER BY m.time_created, p.time_created", (sid,)).fetchall()
+            texts: dict[str, list] = {}
+            for r in rows:
+                try:
+                    m, p = json.loads(r["mdata"]), json.loads(r["pdata"])
+                except ValueError:
+                    continue
+                if p.get("type") != "text" or p.get("synthetic") or p.get("ignored"):
+                    continue
+                entry = texts.setdefault(r["mid"], [m.get("role"), [], r["t"] / 1000.0])
+                entry[1].append(p.get("text") or "")
+            for role, parts, ts in texts.values():
+                text = "\n".join(t for t in parts if t.strip()).strip()
+                if role in ("user", "assistant") and text:
+                    turns.append((role, text, ts))
+            yield sid, turns
+    finally:
+        conn.close()
+
+
+def _gemini_sessions(home: Path):
+    """The Gemini CLI's chat files (~/.gemini/tmp/<project>/chats/session-*.json)."""
+    for path in sorted(home.glob(".gemini/tmp/*/chats/session-*.json")):
+        try:
+            chat = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        turns = []
+        for msg in chat.get("messages") or []:
+            content = msg.get("content")
+            text = (content if isinstance(content, str) else "\n".join(
+                c.get("text", "") for c in content or [] if isinstance(c, dict))).strip()
+            role = {"user": "user", "gemini": "assistant"}.get(msg.get("type"))
+            if role and text:
+                turns.append((role, text, _epoch(msg.get("timestamp"))))
+        yield chat.get("sessionId") or path.stem, turns
+
+
+def _antigravity_ide_sessions(home: Path):
+    """The Antigravity IDE keeps the same transcripts under ~/.gemini/antigravity."""
+    yield from _antigravity_sessions(home, home / ".gemini" / "antigravity" / "brain")
+
+
+def _antigravity_sessions(home: Path, root: Path | None = None):
+    root = root or home / ".gemini" / "antigravity-cli" / "brain"
     for path in sorted(root.glob("*/.system_generated/logs/transcript.jsonl")):
         turns = []
         for o in _jsonl(path):

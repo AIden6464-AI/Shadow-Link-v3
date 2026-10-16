@@ -11,8 +11,8 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -104,8 +104,12 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                         "half_life": half_life_str
                     })
                 
+                db_file = Path(db.db_path)
+                db_bytes = sum(p.stat().st_size for p in (db_file, Path(f"{db_file}-wal"))
+                               if p.exists())
                 response_data = {
                     "database_path": str(db.db_path),
+                    "database_bytes": db_bytes,
                     "total_prompts": len(prompts),
                     "total_edges": db.stats()["total_edges"],
                     "jaccard_threshold": config.jaccard_threshold,
@@ -131,6 +135,9 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
         elif path_str.startswith("/aca/"):
             params = {k: v[0] for k, v in parse_qs(parsed_path.query).items()}
             self.handle_aca(path_str, params)
+        elif path_str == "/sessions" or path_str.startswith("/sessions/") or path_str == "/threads":
+            params = {k: v[0] for k, v in parse_qs(parsed_path.query).items()}
+            self.handle_sessions_get(path_str, params)
         else:
             self.send_error(404, "Not found")
 
@@ -187,6 +194,9 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.handle_watch_select(data)
         elif parsed_path.path.startswith("/aca/"):
             self.handle_aca(parsed_path.path, data)
+        elif parsed_path.path in ("/track/event", "/handoff", "/forget", "/sessions/rebuild") or (
+                parsed_path.path.startswith("/sessions/") and parsed_path.path.endswith("/digest")):
+            self.handle_sessions_post(parsed_path.path, data)
         else:
             self.send_error(404, "Endpoint not found")
 
@@ -202,7 +212,7 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     pass
             
             created_time = p.get("created_at", time.time()) if p else time.time()
-            timestamp_str = datetime.utcfromtimestamp(created_time).isoformat() + "Z"
+            timestamp_str = datetime.fromtimestamp(created_time, timezone.utc).replace(tzinfo=None).isoformat() + "Z"
             
             serialized_matches.append({
                 "prompt": {
@@ -225,7 +235,11 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Parameter 'text' must be a non-empty string")
             return
             
-        top_k = data.get("top_k", 5)
+        try:
+            top_k = max(1, min(int(data.get("top_k", 5)), 100))
+        except (ValueError, TypeError):
+            self.send_error(400, "Parameter 'top_k' must be an integer")
+            return
         threshold = data.get("threshold")
         if threshold is not None:
             try:
@@ -256,8 +270,17 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             
         try:
             config = Config()
-            from shadow_link.live import build_prediction
-            ghost, alternates = build_prediction(str(config.db_path), question, top_k=5)
+            import shadow_link.live as live_mod
+            # One prediction per Claude reply: the transcript watcher and the plugin
+            # both ask, and each may run the local model, so whoever is second reuses it.
+            watcher = live_mod.ACTIVE_WATCHER
+            cached = watcher.cached_prediction(question) if watcher is not None else None
+            if cached is not None:
+                ghost, alternates = cached
+            else:
+                ghost, alternates = live_mod.build_prediction(str(config.db_path), question, top_k=5)
+                if watcher is not None:
+                    watcher.remember_prediction(question, ghost, alternates)
 
             best_match = None
             if ghost:
@@ -500,8 +523,12 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
         try:
             from shadow_link.ingester import classify_multi
             qs = parse_qs(parsed_path.query)
-            limit = int(qs.get("limit", ["200"])[0])
-            offset = int(qs.get("offset", ["0"])[0])
+            try:
+                limit = max(1, min(int(qs.get("limit", ["200"])[0]), 1000))
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+            except ValueError:
+                self.send_error(400, "'limit' and 'offset' must be integers")
+                return
             search = (qs.get("q", [""])[0]).strip().lower()
             bucket_filter = qs.get("bucket", [None])[0]
             FLAG_BUCKETS = {"rejection", "correction", "pivot"}
@@ -533,7 +560,7 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     "flagged": flagged,
                     "source": meta.get("source", "unknown"),
                     "created_at": created,
-                    "timestamp": (datetime.utcfromtimestamp(created).isoformat() + "Z") if created else None,
+                    "timestamp": (datetime.fromtimestamp(created, timezone.utc).replace(tzinfo=None).isoformat() + "Z") if created else None,
                 }
                 if bucket_filter and bucket_filter not in tags and r["bucket"] != bucket_filter:
                     continue
@@ -916,10 +943,117 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             logger.error(f"Error in {path}: {e}", exc_info=True)
             self.send_error(500, str(e))
 
+    # ------------------------------------------------ Shadow Core: agent sessions
+    def _send_json(self, payload, status=200):
+        self._set_headers(status)
+        self.wfile.write(json.dumps(payload, default=str).encode("utf-8"))
+
+    def _sessions(self):
+        from shadow_link.aca.store import CognitiveStore
+        from shadow_link.tracker import SessionStore
+        store = CognitiveStore(Config().db_path)
+        return store, SessionStore(store)
+
+    def handle_sessions_get(self, path, params):
+        """GET /sessions, /sessions/<id>, /threads: what every agent is doing."""
+        try:
+            from shadow_link.tracker import session_summary, TRACKER
+            _, sessions = self._sessions()
+            if path == "/sessions":
+                try:
+                    limit = max(1, min(int(params.get("limit", 20)), 200))
+                except ValueError:
+                    self.send_error(400, "limit must be an integer")
+                    return
+                items = sessions.list(project=params.get("project", ""), agent=params.get("agent", ""),
+                                      active_only=params.get("active") in ("1", "true"), limit=limit,
+                                      exclude=params.get("exclude", ""),
+                                      include_automated=params.get("automated") in ("1", "true"))
+                self._send_json({"sessions": items,
+                                 "tracking": TRACKER is not None,
+                                 "problems": dict(TRACKER.errors) if TRACKER else {}})
+            elif path == "/threads":
+                self._send_json({"threads": sessions.threads(project=params.get("project", ""))})
+            else:
+                rec = sessions.load(path[len("/sessions/"):])
+                if rec is None:
+                    self.send_error(404, "Unknown session")
+                    return
+                self._send_json({"session": session_summary(rec), "record": rec})
+        except ConnectionError as e:
+            logger.info(f"Connection closed by client during GET {path}: {e}")
+        except Exception as e:
+            logger.error(f"Error in GET {path}: {e}", exc_info=True)
+            self.send_error(500, str(e))
+
+    def handle_sessions_post(self, path, data):
+        """POST /track/event, /sessions/<id>/digest, /handoff."""
+        try:
+            from shadow_link import tracker as tracker_mod
+            store, sessions = self._sessions()
+            if path == "/track/event":
+                what = str(data.get("what") or data.get("text") or "")
+                files = data.get("files") or []
+                if not what and not files and not data.get("command"):
+                    self.send_error(400, "Give 'what', 'files' or 'command'")
+                    return
+                tr = tracker_mod.TRACKER or tracker_mod.SessionTracker(Config().db_path)
+                sid = tr.report(str(data.get("agent") or "agent"), what,
+                                session=str(data.get("session") or ""),
+                                project=str(data.get("project") or ""),
+                                files=[str(f) for f in files if isinstance(f, str)],
+                                command=str(data.get("command") or ""),
+                                status=data.get("status") if data.get("status") in ("ok", "error") else None)
+                self._send_json({"session": sid})
+            elif path == "/sessions/rebuild":
+                tr = tracker_mod.TRACKER or tracker_mod.SessionTracker(Config().db_path)
+                self._send_json({"sessions": tr.rebuild()})
+            elif path == "/forget":
+                target = data.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self.send_error(400, "Parameter 'target' (session id or project folder) is required")
+                    return
+                out = (tracker_mod.TRACKER.forget(target.strip()) if tracker_mod.TRACKER
+                       else sessions.forget(target.strip()))
+                self._send_json(out)
+            elif path == "/handoff":
+                sid = data.get("session")
+                if not isinstance(sid, str) or not sid:
+                    self.send_error(400, "Parameter 'session' is required")
+                    return
+                packet = tracker_mod.build_handoff(store, sid, str(data.get("to_agent") or ""))
+                if packet is None:
+                    self.send_error(404, "Unknown session")
+                    return
+                self._send_json(packet)
+            else:
+                sid = path[len("/sessions/"):-len("/digest")]
+                text = data.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self.send_error(400, "Parameter 'text' must be a non-empty string")
+                    return
+                by = str(data.get("by") or "client")
+                decisions = [str(d) for d in data.get("decisions") or [] if isinstance(d, str)][:10]
+                rec = (tracker_mod.TRACKER.set_digest(sid, text.strip(), by, decisions) if tracker_mod.TRACKER
+                       else sessions.set_digest(sid, text.strip(), by, decisions))
+                if rec is None:
+                    self.send_error(404, "Unknown session")
+                    return
+                self._send_json({"session": tracker_mod.session_summary(rec)})
+        except ConnectionError as e:
+            logger.info(f"Connection closed by client during POST {path}: {e}")
+        except Exception as e:
+            logger.error(f"Error in POST {path}: {e}", exc_info=True)
+            self.send_error(500, str(e))
+
+
 def run_api_server(host="localhost", port=None):
     if port is None:
         port = int(os.environ.get("SHADOW_LINK_PORT", 5000))
-    server = HTTPServer((host, port), ShadowLinkAPIHandler)
+    # Threaded: a slow prediction (local LLM, embeddings) must not stall
+    # captures, feedback or the proxy's short nudge lookups.
+    server = ThreadingHTTPServer((host, port), ShadowLinkAPIHandler)
+    server.daemon_threads = True
     logger.info(f"API Server listening on http://{host}:{port}")
     try:
         server.serve_forever()

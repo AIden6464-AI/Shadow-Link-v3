@@ -12,7 +12,23 @@ export type ShadowWhy = { title: string; type: string; reason: string }
 
 export type ShadowAnswer = { question: string; text: string; isPending: boolean }
 
-export type ShadowStats = { corpus: number | null; learned: number }
+export type ShadowStats = { corpus: number | null; learned: number; bytes?: number | null }
+
+/** One coding-agent session Shadow is tracking (Claude Code, Codex, Antigravity). */
+export type ShadowAgent = {
+  id: string
+  label: string
+  projectName: string
+  state: 'active' | 'idle' | 'ended'
+  doing: string
+  goal: string
+  openThread: string
+  last: number
+  digest: string
+  needsDigest: boolean
+}
+
+export type ShadowThread = { session: string; agent: string; projectName: string; text: string }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -30,6 +46,14 @@ declare module 'claude-code' {
       recent: string[]
       /** True while a model drafts the ghost for the turn that just ended. */
       isDrafting: boolean
+      /** Other agents' recent sessions, newest first. */
+      agents: ShadowAgent[]
+      /** Questions agents left unanswered in this project. */
+      threads: ShadowThread[]
+      /** The agent row expanded in the sidebar, if any. */
+      openAgent: string | null
+      /** Agents whose session files Shadow could not read, with why. */
+      problems: Record<string, string>
     }
   }
 }

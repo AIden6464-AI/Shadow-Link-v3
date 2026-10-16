@@ -228,14 +228,70 @@ _IMAGE_REF_RE = re.compile(r"\[Image[^\]]*\]|<image>\s*</image>")
 _WRAPPER_RE = re.compile(r"^<[A-Za-z_][\w-]*[\s>]")
 
 
+# A paste of terminal output opens with a shell prompt ("PS D:\\app> ...",
+# "user@host:~$ ..."); a paste of a log is mostly lines that are not prose.
+_SHELL_PROMPT_RE = re.compile(r"^(?:PS [A-Za-z]:\\[^>\n]*>|[\w.-]+@[\w.-]+:[^$\n]*\$|[A-Za-z]:\\[^>\n]*>)")
+_PROSE_LINE_RE = re.compile(r"^[A-Za-z\"'(]")
+
+
+# Lines that read like words but are code or a stack frame.
+_CODE_LINE_RE = re.compile(
+    r"^(?:File \"|from [\w.]+ import |import [\w.]+|def |class |async def |return |@\w|if __name__)"
+    r"|[{};]\s*$|^\s*[\w.]+\(.*\)\s*$|\w+\s*=\s*\S")
+
+
+def _is_prose(line: str) -> bool:
+    return (bool(_PROSE_LINE_RE.match(line)) and len(line.split()) >= 3
+            and not _SHELL_PROMPT_RE.match(line) and not _CODE_LINE_RE.search(line))
+
+
+_DUMP_START_RE = re.compile(
+    r"^(?:Traceback \(most recent call last\)|Exception in thread|npm (?:ERR!|error)|error\[E\d+\]|"
+    r"\w*(?:Error|Exception): |at [\w.$<>]+\(|Uncaught |FATAL|panic: |Windows PowerShell$|Starting Container)")
+
+
+def _looks_pasted(lines: list[str]) -> bool:
+    if not lines:
+        return False
+    if _SHELL_PROMPT_RE.match(lines[0]) or _DUMP_START_RE.match(lines[0]):
+        return True
+    return len(lines) >= 3 and sum(map(_is_prose, lines)) / len(lines) < 0.3
+
+
+def is_pasted_output(text: str) -> bool:
+    """Terminal output or a log the person pasted, with no words of their own first."""
+    lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
+    if not lines or _is_prose(lines[0]):
+        return False
+    return _looks_pasted(lines)
+
+
+def _drop_pasted_tail(text: str) -> str:
+    """'can you fix this\n\n<a pasted log>' keeps only what the person wrote."""
+    lines = text.splitlines()
+    for i in range(1, len(lines)):
+        rest = [ln.strip() for ln in lines[i:] if ln.strip()]
+        if not lines[i].strip() or len(rest) < 3:
+            continue
+        if _looks_pasted(rest):
+            return "\n".join(lines[:i]).strip()
+    return text
+
+
 def clean_reply(text: str) -> str:
-    """What the person typed, without image placeholders such as "[Image #2]"."""
-    return re.sub(r"[ 	]{2,}", " ", _IMAGE_REF_RE.sub(" ", text or "")).strip()
+    """What the person typed: no image placeholders ("[Image #2]") and no pasted log under it."""
+    t = re.sub(r"[ \t]{2,}", " ", _IMAGE_REF_RE.sub(" ", text or "")).strip()
+    return _drop_pasted_tail(t) if "\n" in t else t
 
 
 def is_real_reply(text: str) -> bool:
     """Filter out non-reactions: slash commands, CC wrappers, nudges, trivia."""
-    t = clean_reply(text)
+    raw = (text or "").strip()
+    # Judge what was sent before trimming it: a pasted log trimmed to its first
+    # line, or a handoff brief trimmed above its marker, would look typed.
+    if is_pasted_output(_IMAGE_REF_RE.sub(" ", raw)):
+        return False
+    t = clean_reply(raw)
     if len(t) < 4 or t.startswith("/") or _WRAPPER_RE.match(t):
         return False
     markers = (
@@ -244,10 +300,13 @@ def is_real_reply(text: str) -> bool:
         "Shadow Link context",
         "Caveat:", "Shell cwd was reset",
         "The following is the Codex agent history",   # Codex's approval reviewer, not a person
+        "# Files mentioned by the user:",             # Codex attachments with no words of the person's
+        "Shadow handoff H-",                          # a handoff brief sent on, not the person's voice
+        "Base directory for this skill:",             # a skill's instructions Claude Code loaded
         "A session-scoped Stop hook is now active",
         "CORPUS SHAPE", "SHADOW LINK", "GHOST (", "[CLAUDE]", "[GHOST",
     )
-    if any(m in t for m in markers):
+    if any(m in raw for m in markers):
         return False
     if any(ch in t for ch in "│╭╮╰╯├┤┌┐└┘─━┃"):
         return False
@@ -344,6 +403,22 @@ class LiveWatcher:
         except Exception as e:
             log.warning("warm: aborted: %s", e)
 
+    def cached_prediction(self, claude_output: str):
+        """(ghost, alternates) already predicted for this exact reply, or None."""
+        text = " ".join((claude_output or "").split())
+        with self._lock:
+            if text and " ".join((self._state.get("claude_output") or "").split()) == text:
+                return self._state.get("ghost"), list(self._state.get("alternates") or [])
+        return None
+
+    def remember_prediction(self, claude_output: str, ghost, alternates) -> None:
+        """A prediction made elsewhere (the plugin's /predict) for the reply this watcher will see."""
+        with self._lock:
+            self._state["claude_output"] = claude_output
+            self._state["ghost"] = ghost
+            self._state["alternates"] = alternates
+            self._state["updated_at"] = time.time()
+
     def get_state(self) -> dict:
         with self._lock:
             s = dict(self._state)
@@ -394,7 +469,8 @@ class LiveWatcher:
         if role == "assistant":
             with self._lock:
                 self._last_claude = text
-            ghost, alts = self._predict(text)
+            cached = self.cached_prediction(text)       # the plugin's /predict may have been first
+            ghost, alts = cached if cached is not None else self._predict(text)
             with self._lock:
                 self._state["claude_output"] = text
                 self._state["ghost"] = ghost
