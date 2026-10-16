@@ -98,6 +98,17 @@ def test_categorizer_whole_words_and_requests():
     assert classify_multi("switch to postgres instead") == ["pivot"]
 
 
+def test_pasted_output_is_not_your_voice():
+    from shadow_link.live import is_real_reply, clean_reply
+    assert not is_real_reply("PS D:\\app> npm start\n> app@1.0 start\nError: boom")
+    assert not is_real_reply("reid@box:~$ lms ps\nIDENTIFIER MODEL STATUS")
+    assert not is_real_reply("✅ ready\n⏳ loading\n🔊 [x] queued\n[2026] done")
+    kept = "can you fix this crash\n\nTraceback (most recent call last):\n  File x.py, line 1\n    boom()\nNameError: boom"
+    assert is_real_reply(kept) and clean_reply(kept) == "can you fix this crash"
+    assert clean_reply("like the sidebar in opencode [Image #2]") == "like the sidebar in opencode"
+    assert is_real_reply("ok build it with the venv")
+
+
 def test_add_prompt_unique_is_atomic(tmp_path: Path):
     db = Database(tmp_path / "u.db")
     meta = {"agent_output": "I'll add docker"}
@@ -186,6 +197,103 @@ def test_report_tracks_any_agent(tmp_path: Path):
     assert rec["agent"] == "cursor" and rec["goal"] == "set up lint" and rec["commands"][-1]["status"] == "ok"
 
 
+def test_decisions_are_remembered_and_linked(home: Path, tmp_path: Path):
+    log = home / ".claude/projects/repo/claude-sess.jsonl"
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "user", "sessionId": "claude-sess", "cwd": str(home / "repo"),
+                            "timestamp": "2026-10-16T12:10:00Z",
+                            "message": {"role": "user", "content": "let's go with postgres, don't use sqlite"}}) + "\n")
+    tr = _tracker(home, tmp_path)
+    tr.poll_once()
+    claude = [s for s in tr.sessions.list() if s["agent"] == "claude-code"][0]
+    rec = tr.sessions.load(claude["id"])
+    assert [d["text"] for d in rec["decisions"]] == ["let's go with postgres, don't use sqlite"]
+    decisions = tr.sessions._linked(claude["id"], "decision")
+    assert len(decisions) == 1 and decisions[0]["content"].startswith("let's go with postgres")
+    assert "## Decisions the user made" in T.build_handoff(tr.store, claude["id"])["markdown"]
+    assert not T.is_decision("can you check the logs?") and T.is_decision("switch to pnpm instead")
+    assert not T.is_decision("i don't really like how it looks")            # an opinion, not a decision
+    q = "Should I merge it now, or wait?"
+    assert T.decision_text("yes do it", q) == f"yes do it (answering: {q})"
+    assert T.decision_text("do option 2", q).startswith("do option 2 (answering:")
+    assert T.decision_text("ok installed", q) == "" and T.decision_text("sure", "") == ""
+
+
+def test_handoff_links_the_session_that_picks_it_up(home: Path, tmp_path: Path):
+    tr = _tracker(home, tmp_path)
+    tr.poll_once()
+    codex = [s for s in tr.sessions.list() if s["agent"] == "codex"][0]
+    packet = T.build_handoff(tr.store, codex["id"], "claude-code")
+    assert f"Shadow handoff {packet['id']}" in packet["markdown"]
+    _jsonl(home / ".claude/projects/repo/new-sess.jsonl", [
+        {"type": "user", "sessionId": "new-sess", "cwd": str(home / "repo"), "timestamp": "2026-10-16T13:00:00Z",
+         "message": {"role": "user", "content": packet["markdown"]}}])
+    tr.poll_once()
+    new = tr.sessions.load(T.session_node_id("claude-code", "new-sess"))
+    assert new["handoff_from"] == packet["id"] and new["requests"] == []     # the brief is not "what you said"
+    assert tr.store.get_node(packet["id"])["metadata"]["to_session"] == new["id"]
+    from shadow_link.live import is_real_reply
+    assert not is_real_reply(packet["markdown"])                            # never learned as your reply
+
+
+def test_antigravity_ide_is_tracked_too(tmp_path: Path):
+    _jsonl(tmp_path / ".gemini/antigravity/brain/ide-sess/.system_generated/logs/transcript.jsonl", [
+        {"type": "USER_INPUT", "source": "USER_EXPLICIT", "created_at": "2026-10-16T12:00:00Z",
+         "content": "<USER_REQUEST>\nbuild the settings page\n</USER_REQUEST>"}])
+    tr = _tracker(tmp_path, tmp_path)
+    tr.poll_once()
+    (s,) = tr.sessions.list()
+    assert s["agent"] == "antigravity-ide" and s["label"] == "Antigravity IDE" and s["goal"] == "build the settings page"
+
+
+def test_ignored_projects_are_not_recorded(home: Path, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHADOW_TRACK_IGNORE", str(home / "repo"))
+    tr = _tracker(home, tmp_path)
+    assert tr.poll_once() == [] and tr.sessions.list() == []
+
+
+def test_saves_only_touch_what_changed(home: Path, tmp_path: Path, monkeypatch):
+    tr = _tracker(home, tmp_path)
+    tr.poll_once()
+    writes = []
+    real_update = tr.store.update_node
+    monkeypatch.setattr(tr.store, "update_node", lambda nid, **kw: (writes.append(nid), real_update(nid, **kw)))
+    log = home / ".codex/sessions/2026/10/16/rollout-2026-10-16-codexsess.jsonl"
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "response_item", "timestamp": "2026-10-16T12:20:00Z", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "looks good"}]}}) + "\n")
+    tr.poll_once()
+    assert not any(w.startswith("A-") for w in writes)      # no file changed, so no activity rewrite
+
+
+def test_rebuild_rereads_and_keeps_model_summaries(home: Path, tmp_path: Path):
+    tr = _tracker(home, tmp_path)
+    tr.poll_once()
+    codex = [s for s in tr.sessions.list() if s["agent"] == "codex"][0]
+    tr.set_digest(codex["id"], "Codex added rate limiting; npm test fails.", "haiku")
+    before = {s["id"]: s for s in tr.sessions.list()}
+    assert tr.rebuild() == 3
+    after = {s["id"]: s for s in tr.sessions.list()}
+    assert set(after) == set(before)
+    assert after[codex["id"]]["digest"] == "Codex added rate limiting; npm test fails."
+    rec = tr.sessions.load(codex["id"])
+    assert rec["requests"].count("add rate limiting to the api") == 1         # read once, not twice
+    assert list(rec["files"].values())[0]["edits"] == 1
+
+
+def test_prune_and_forget(home: Path, tmp_path: Path):
+    tr = _tracker(home, tmp_path)
+    tr.poll_once()
+    assert tr.prune(time.time())["activity"] == 0            # nothing old yet
+    assert tr.prune(time.time() + 40 * 86400)["activity"] >= 2
+    claude = [s for s in tr.sessions.list() if s["agent"] == "claude-code"][0]
+    assert tr.forget(claude["id"])["sessions"] == 1
+    assert claude["id"] not in {s["id"] for s in tr.sessions.list()}
+    out = tr.forget(str(home / "repo"))
+    assert out["sessions"] == 2 and tr.sessions.list() == []
+    assert not tr.store._ids_where("type = 'project'")
+
+
 # ------------------------------------------------------------------ phase 4
 def test_handoff_brief(home: Path, tmp_path: Path):
     tr = _tracker(home, tmp_path)
@@ -243,6 +351,11 @@ def test_session_endpoints(home: Path, tmp_path: Path, monkeypatch):
         assert post("/handoff", {"session": codex["id"]})["markdown"].startswith("# Handoff from Codex")
         assert post(f"/sessions/{codex['id']}/digest", {"text": "Rate limiting done.", "by": "haiku"})["session"]["digest"] == "Rate limiting done."
         assert post("/track/event", {"agent": "aider", "what": "renamed utils"})["session"].startswith("S-aider-")
+        assert get("/stats")["database_bytes"] > 0
+        forgot = post("/forget", {"target": codex["id"]})
+        assert forgot["sessions"] == 1 and forgot["nodes"] >= 2      # the session and its activity
+        assert codex["id"] not in {s["id"] for s in get("/sessions")["sessions"]}
+        assert post("/forget", {"target": codex["id"]})["sessions"] == 0
     finally:
         server.shutdown()
 

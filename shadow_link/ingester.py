@@ -327,7 +327,8 @@ class Ingester:
         from shadow_link.live import clean_reply, is_real_reply
 
         home = Path(home) if home else Path.home()
-        readers = {"claude": _claude_code_sessions, "codex": _codex_sessions, "agy": _antigravity_sessions}
+        readers = {"claude": _claude_code_sessions, "codex": _codex_sessions, "agy": _antigravity_sessions,
+                   "agy-ide": _antigravity_ide_sessions}
 
         existing: set[tuple[str, str]] = set()
         for r in self.db.all_prompts():
@@ -479,8 +480,13 @@ def _codex_sessions(home: Path):
 _AGY_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 
 
-def _antigravity_sessions(home: Path):
-    root = home / ".gemini" / "antigravity-cli" / "brain"
+def _antigravity_ide_sessions(home: Path):
+    """The Antigravity IDE keeps the same transcripts under ~/.gemini/antigravity."""
+    yield from _antigravity_sessions(home, home / ".gemini" / "antigravity" / "brain")
+
+
+def _antigravity_sessions(home: Path, root: Path | None = None):
+    root = root or home / ".gemini" / "antigravity-cli" / "brain"
     for path in sorted(root.glob("*/.system_generated/logs/transcript.jsonl")):
         turns = []
         for o in _jsonl(path):

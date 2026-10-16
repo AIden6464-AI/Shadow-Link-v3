@@ -12,7 +12,7 @@ export type ShadowWhy = { title: string; type: string; reason: string }
 
 export type ShadowAnswer = { question: string; text: string; isPending: boolean }
 
-export type ShadowStats = { corpus: number | null; learned: number }
+export type ShadowStats = { corpus: number | null; learned: number; bytes?: number | null }
 
 /** One coding-agent session Shadow is tracking (Claude Code, Codex, Antigravity). */
 export type ShadowAgent = {
@@ -52,6 +52,8 @@ declare module 'claude-code' {
       threads: ShadowThread[]
       /** The agent row expanded in the sidebar, if any. */
       openAgent: string | null
+      /** Agents whose session files Shadow could not read, with why. */
+      problems: Record<string, string>
     }
   }
 }

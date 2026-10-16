@@ -43,6 +43,13 @@
     "port": 5000
   },
 
+  "tracking": {
+    "_comment": "Shadow Core: `shadow-link daemon` follows Claude Code, Codex and Antigravity sessions. Folders under 'ignore' are never recorded; raw activity older than keep_activity_days is pruned (sessions, summaries and decisions stay).",
+    "enabled": true,
+    "ignore": [],
+    "keep_activity_days": 30
+  },
+
   "proxy": {
     "_comment": "inject_nudges appends Shadow Link context to your new message (off by default; the UserPromptSubmit hook is the preferred channel). inject_synthesized also includes the local LLM's predicted reaction. The lookup runs before the request is forwarded: nudge_timeout_seconds caps it, nudge_budget_seconds caps the LLM inside it (must be lower).",
     "daemon_url": "http://localhost:5000",

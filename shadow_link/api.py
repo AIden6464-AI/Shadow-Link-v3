@@ -104,8 +104,12 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                         "half_life": half_life_str
                     })
                 
+                db_file = Path(db.db_path)
+                db_bytes = sum(p.stat().st_size for p in (db_file, Path(f"{db_file}-wal"))
+                               if p.exists())
                 response_data = {
                     "database_path": str(db.db_path),
+                    "database_bytes": db_bytes,
                     "total_prompts": len(prompts),
                     "total_edges": db.stats()["total_edges"],
                     "jaccard_threshold": config.jaccard_threshold,
@@ -190,7 +194,7 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.handle_watch_select(data)
         elif parsed_path.path.startswith("/aca/"):
             self.handle_aca(parsed_path.path, data)
-        elif parsed_path.path in ("/track/event", "/handoff") or (
+        elif parsed_path.path in ("/track/event", "/handoff", "/forget", "/sessions/rebuild") or (
                 parsed_path.path.startswith("/sessions/") and parsed_path.path.endswith("/digest")):
             self.handle_sessions_post(parsed_path.path, data)
         else:
@@ -983,6 +987,17 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                                 command=str(data.get("command") or ""),
                                 status=data.get("status") if data.get("status") in ("ok", "error") else None)
                 self._send_json({"session": sid})
+            elif path == "/sessions/rebuild":
+                tr = tracker_mod.TRACKER or tracker_mod.SessionTracker(Config().db_path)
+                self._send_json({"sessions": tr.rebuild()})
+            elif path == "/forget":
+                target = data.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self.send_error(400, "Parameter 'target' (session id or project folder) is required")
+                    return
+                out = (tracker_mod.TRACKER.forget(target.strip()) if tracker_mod.TRACKER
+                       else sessions.forget(target.strip()))
+                self._send_json(out)
             elif path == "/handoff":
                 sid = data.get("session")
                 if not isinstance(sid, str) or not sid:

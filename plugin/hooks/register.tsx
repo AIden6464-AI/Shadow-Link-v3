@@ -24,6 +24,7 @@ const draftingAtom = atom({ plugin: 'shadow-link', key: 'isDrafting' } as const,
 const agentsAtom = atom({ plugin: 'shadow-link', key: 'agents' } as const, [] as ShadowAgent[])
 const threadsAtom = atom({ plugin: 'shadow-link', key: 'threads' } as const, [] as ShadowThread[])
 const openAgentAtom = atom({ plugin: 'shadow-link', key: 'openAgent' } as const, null as string | null)
+const problemsAtom = atom({ plugin: 'shadow-link', key: 'problems' } as const, {} as Record<string, string>)
 
 // The Shadow Link terminal palette (docs/brand.md, shadow_link/tui.py).
 const THEME = {
@@ -96,7 +97,8 @@ const toAlt = (raw: any): ShadowAlt | null =>
 async function refreshStats($: EngineInterface) {
   const data = await call($, 'GET', '/stats')
   if (data && typeof data.total_prompts === 'number') {
-    await update($, statsAtom, s => ({ ...s, corpus: data.total_prompts }))
+    const bytes = typeof data.database_bytes === 'number' ? data.database_bytes : null
+    await update($, statsAtom, s => ({ ...s, corpus: data.total_prompts, bytes }))
   }
 }
 
@@ -241,7 +243,9 @@ async function ask($: EngineInterface, question: string) {
         : `- (${i.type}) ${String(i.content ?? '').slice(0, 300)}`)
     .join('\n')
 
-  const others = agentsContext(await read($, agentsAtom))
+  const agents = await read($, agentsAtom)
+  const others = agentsContext(agents)
+  const timelines = await namedTimelines($, q, agents)
 
   const prompt = [
     'This is a side question from the user to Shadow, a separate assistant watching this session.',
@@ -250,6 +254,7 @@ async function ask($: EngineInterface, question: string) {
     'and do not call tools.',
     recalled ? `\nWhat Shadow Link remembers about this user:\n${recalled}` : '',
     others ? `\nWhat Shadow has seen the user's other coding agents doing:\n${others}` : '',
+    timelines ? `\nDetail for the sessions this question is about:\n${timelines}` : '',
     `\nQuestion: ${q}`,
   ].join('\n')
 
@@ -294,6 +299,8 @@ async function refreshAgents($: EngineInterface) {
   if (!data || !Array.isArray(data.sessions)) return
   const agents = data.sessions.map(toAgent)
   await update($, agentsAtom, () => agents)
+  const problems = data.problems && typeof data.problems === 'object' ? data.problems : {}
+  await update($, problemsAtom, () => Object.fromEntries(Object.entries(problems).map(([k, v]) => [k, String(v)])))
   const t = await call($, 'GET', `/threads?project=${encodeURIComponent(session.cwd)}`)
   if (t && Array.isArray(t.threads)) {
     await update($, threadsAtom, () => t.threads
@@ -352,6 +359,35 @@ async function handOver($: EngineInterface, sessionId: string): Promise<boolean>
   await useGhost($, packet.markdown)
   $.ui.toast(`Handoff from ${packet.from_label ?? 'the agent'} is in the chat bar: send it to continue`)
   return true
+}
+
+/** The full timeline of up to two sessions the question names (by agent or project). */
+async function namedTimelines($: EngineInterface, question: string, agents: ShadowAgent[]) {
+  const q = question.toLowerCase()
+  const named = agents.filter(a =>
+    q.includes(a.label.toLowerCase()) || (a.projectName && q.includes(a.projectName.toLowerCase())))
+  const parts: string[] = []
+  for (const a of named.slice(0, 2)) {
+    const d = await call($, 'GET', `/sessions/${encodeURIComponent(a.id)}`)
+    const rec = d?.record
+    if (!rec) continue
+    const files = Object.entries(rec.files ?? {})
+      .sort((x: any, y: any) => y[1].last - x[1].last).slice(0, 10)
+      .map(([f, i]: any) => `${f} (${i.edits}x)`)
+    parts.push([
+      `${a.label} in ${a.projectName} (${a.state}, last active ${ago(a.last)} ago)`,
+      `  goal: ${clip(rec.goal ?? '', 200)}`,
+      rec.requests?.length ? `  requests: ${rec.requests.map((r: string) => clip(r, 140)).join(' | ')}` : '',
+      files.length ? `  files changed: ${files.join(', ')}` : '',
+      rec.commands?.length ? `  commands: ${rec.commands.slice(-6).map((c: any) => `${clip(c.cmd, 80)}${c.status === 'error' ? ' (failed)' : ''}`).join(' | ')}` : '',
+      rec.tests?.length ? `  last tests: ${rec.tests[rec.tests.length - 1].status === 'ok' ? 'passed' : 'failed'}` : '',
+      rec.errors?.length ? `  errors: ${rec.errors.map((e: any) => clip(e.what, 80)).join(' | ')}` : '',
+      rec.decisions?.length ? `  decisions: ${rec.decisions.map((x: any) => clip(x.text, 120)).join(' | ')}` : '',
+      rec.digest ? `  summary: ${clip(rec.digest, 400)}` : '',
+      rec.open_thread ? `  waiting on: ${rec.open_thread}` : '',
+    ].filter(Boolean).join('\n'))
+  }
+  return parts.join('\n')
 }
 
 /** What Shadow has seen the other agents doing, for side questions. */
@@ -606,9 +642,13 @@ export const register: Register = (on, options) => {
     const openAgent = await read($, openAgentAtom)
     const dot = (s: ShadowAgent['state']) => (s === 'active' ? THEME.signal : s === 'idle' ? THEME.warn : THEME.muted)
     const shown = agents.slice(0, isDocked ? 5 : 2)
+    const problems = Object.entries(await read($, problemsAtom))
     const agentsSection = online ? (
       <Box key="agents" flexDirection="column">
         {section('agents-head', 'AGENTS')}
+        {problems.map(([agent, why], i) => (
+          <Text key={`problem-${i}`} color={THEME.warn} wrap="wrap">{'  '}can't read {agent}: {clip(why, 120)}</Text>
+        ))}
         {shown.length === 0 ? (
           <Text key="agents-none" color={THEME.muted} wrap="wrap">No other agent sessions yet. Codex and Antigravity show up here as they work.</Text>
         ) : (
@@ -679,6 +719,11 @@ export const register: Register = (on, options) => {
         {stats.learned > 0 ? (
           <Text key="memory-session" color={THEME.text}>
             {isDocked ? '  ' : ''}{stats.learned} <Text color={THEME.muted}>this session</Text>
+          </Text>
+        ) : null}
+        {isDocked && stats.bytes ? (
+          <Text key="memory-size" color={THEME.text}>
+            {'  '}{(stats.bytes / 1048576).toFixed(1)} MB <Text color={THEME.muted}>on disk</Text>
           </Text>
         ) : null}
       </Box>

@@ -190,14 +190,14 @@ def shadow_sessions(project: str = "", agent: str = "", active_only: bool = Fals
 @mcp.tool()
 def shadow_activity(session: str) -> str:
     """
-    One session's timeline: goal, recent requests, files changed, commands run
+    One session's timeline: goal, recent requests, decisions, files changed, commands run
     (with pass/fail), test runs, errors and the digest. `session` is an id from
     shadow_sessions.
     """
     rec = _sessions().load(session)
     if rec is None:
         return json.dumps({"error": f"Unknown session '{session}'"})
-    keep = ("agent", "project", "goal", "requests", "files", "commands", "tests", "errors",
+    keep = ("agent", "project", "goal", "requests", "decisions", "files", "commands", "tests", "errors",
             "open_thread", "digest", "last_agent")
     return json.dumps({k: rec[k] for k in keep}, indent=2, default=str)
 

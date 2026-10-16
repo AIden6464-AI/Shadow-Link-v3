@@ -2,6 +2,8 @@
 
 Status: phases 1 to 5 built. Phase 5 is the warning release: the old pieces still work and print what replaces them; removing them is a later release, with your sign-off.
 
+Also built: decisions (a choice you state, or a yes/pick stored with the question it answered), handoff chains (the session that picks a brief up is linked to it), the Antigravity IDE as a fourth source, `tracking.ignore` / `tracking.enabled`, daily pruning, `shadow-link forget`, `sessions --rebuild`, database size in CORE MEMORY, read problems shown under AGENTS, named-session timelines for side questions, and a filter that keeps pasted terminal output and logs out of your replies.
+
 Defaults taken for the open questions below: every project is tracked; digests name files without code diffs; Claude Code, Codex and Antigravity are covered, and any other agent can report through `shadow_report`.
 
 ## Goal

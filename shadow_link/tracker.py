@@ -25,8 +25,9 @@ from pathlib import Path
 
 from shadow_link.aca.store import CognitiveStore
 
-AGENTS = ("claude-code", "codex", "antigravity")
-AGENT_LABELS = {"claude-code": "Claude Code", "codex": "Codex", "antigravity": "Antigravity"}
+AGENTS = ("claude-code", "codex", "antigravity", "antigravity-ide")
+AGENT_LABELS = {"claude-code": "Claude Code", "codex": "Codex", "antigravity": "Antigravity",
+                "antigravity-ide": "Antigravity IDE"}
 
 ACTIVE_SECONDS = 10 * 60          # active: something happened in the last 10 minutes
 IDLE_DIGEST_SECONDS = 10 * 60     # a session quiet this long gets a digest
@@ -88,7 +89,9 @@ def project_root(path: str) -> str:
 
 
 def project_name(root: str) -> str:
-    return Path(root).name if root else "unknown"
+    if not root:
+        return "unknown"
+    return Path(root).name or root     # a drive root ("D:\\") has no folder name
 
 
 _TEST_RE = re.compile(r"\b(pytest|unittest|npm (?:run )?test|pnpm test|yarn test|go test|cargo test|"
@@ -172,7 +175,9 @@ class ClaudeCodeParser(_FileParser):
                             ev["status"] = "error" if b.get("is_error") else "ok"
                             out.append(ev)
             text = operator_text(content)
-            if text and is_real_reply(text):
+            if handoff_ref(text):
+                out.append({"kind": "handoff_in", "handoff": handoff_ref(text), "ts": ts})
+            elif text and is_real_reply(text):
                 out.append({"kind": "user", "text": clean_reply(text), "ts": ts})
         return out
 
@@ -228,6 +233,8 @@ class CodexParser(_FileParser):
             if not text:
                 return []
             if role == "user":
+                if handoff_ref(text):
+                    return [{"kind": "handoff_in", "handoff": handoff_ref(text), "ts": ts}]
                 return [{"kind": "user", "text": clean_reply(text), "ts": ts}] if is_real_reply(text) else []
             return [{"kind": "assistant", "text": text, "ts": ts}]
         if ptype in ("custom_tool_call", "function_call"):
@@ -290,7 +297,9 @@ class AntigravityParser(_FileParser):
         out: list[dict] = []
         if kind == "USER_INPUT" and rec.get("source") == "USER_EXPLICIT" and isinstance(content, str):
             m = _AGY_REQUEST_RE.search(content)
-            if m and is_real_reply(m.group(1)):
+            if m and handoff_ref(m.group(1)):
+                out.append({"kind": "handoff_in", "handoff": handoff_ref(m.group(1)), "ts": ts})
+            elif m and is_real_reply(m.group(1)):
                 out.append({"kind": "user", "text": clean_reply(m.group(1)), "ts": ts})
         elif kind == "PLANNER_RESPONSE":
             if isinstance(content, str) and content.strip():
@@ -324,7 +333,22 @@ SOURCES: list[tuple[str, type[_FileParser], str]] = [
     ("claude-code", ClaudeCodeParser, ".claude/projects/*/*.jsonl"),
     ("codex", CodexParser, ".codex/sessions/*/*/*/rollout-*.jsonl"),
     ("antigravity", AntigravityParser, ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"),
+    # The Antigravity IDE writes the same transcript format under its own folder.
+    ("antigravity-ide", AntigravityParser, ".gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl"),
 ]
+
+
+def _ignored_roots() -> list[str]:
+    raw = os.getenv("SHADOW_TRACK_IGNORE", "")
+    return [os.path.normcase(os.path.normpath(p.strip())) for p in raw.split(";") if p.strip()]
+
+
+def is_ignored(project: str, ignored: list[str]) -> bool:
+    """Projects under a folder in tracking.ignore are never recorded."""
+    if not project:
+        return False
+    p = os.path.normcase(os.path.normpath(project))
+    return any(p == root or p.startswith(root + os.sep) for root in ignored)
 
 
 # ------------------------------------------------------------ session record
@@ -333,9 +357,54 @@ def new_record(agent: str, session_id: str, transcript: str) -> dict:
         "id": session_node_id(agent, session_id), "agent": agent, "session_id": session_id,
         "transcript": transcript, "project": "", "cwd": "", "started": 0.0, "last": 0.0,
         "goal": "", "requests": [], "last_agent": "", "turns": 0,
-        "files": {}, "commands": [], "errors": [], "tests": [],
+        "files": {}, "commands": [], "errors": [], "tests": [], "decisions": [],
         "open_thread": "", "digest": "", "digest_by": "", "digest_at": 0.0,
+        "handoff_from": "",
     }
+
+
+# What changed since the record was last saved, so a save only writes the
+# graph nodes that moved (a Codex session can touch a hundred files).
+def _dirty(rec: dict) -> dict:
+    return rec.setdefault("_dirty", {"files": [], "decisions": [], "project": False, "handoff": ""})
+
+
+# A reply that settles something: a choice, a rule, a direction.
+_DECISION_RE = re.compile(
+    r"(?i)\b(?:let'?s (?:go with|use|do|keep|stick)|go with|we(?:'ll| will) (?:use|go)|i(?:'ll| will) use|"
+    r"use \S+ instead|instead of|i (?:decided|chose|prefer|want)|decided|stick with|switch to|"
+    r"don'?t (?:use|add|touch|change|delete|remove|push|commit|merge|ship)|never (?:use|add)|"
+    r"always (?:use|keep)|keep (?:it|the|using)|"
+    r"yes,? (?:do|use|go|that)|option \d)\b")
+
+
+# A short yes, or a pick among options, only means something next to the question it answers.
+_ANSWER_RE = re.compile(r"(?i)^(?:yes|yeah|yep|yup|ok(?:ay)?(?=\s*(?:$|[,.!]|do\b|go\b|sure|yes|let'?s))|"
+                        r"sure|do it|go(?: for it| ahead)?|sounds good|"
+                        r"(?:do |go with |use )?(?:option|opinion|choice) ?\d|the (?:first|second|third) one)\b")
+
+
+def is_decision(text: str) -> bool:
+    """A reply that settles something on its own ("let's go with postgres", "don't touch auth")."""
+    t = (text or "").strip()
+    return 6 <= len(t) <= 300 and not t.endswith("?") and bool(_DECISION_RE.search(t))
+
+
+def decision_text(reply: str, question: str) -> str:
+    """The decision to remember for this reply, or "" when it settles nothing."""
+    reply = reply.strip()
+    if question and _ANSWER_RE.match(reply) and len(reply) <= 120:
+        return _clip(f"{reply} (answering: {question})", 300)
+    return _clip(reply, 300) if is_decision(reply) else ""
+
+
+_HANDOFF_REF_RE = re.compile(r"Shadow handoff (H-[\w-]+)")
+
+
+def handoff_ref(text: str) -> str:
+    """The handoff id when this message is a Shadow handoff brief being sent on."""
+    m = _HANDOFF_REF_RE.search(text or "")
+    return m.group(1) if m else ""
 
 
 def session_node_id(agent: str, session_id: str) -> str:
@@ -356,17 +425,32 @@ def apply_event(rec: dict, ev: dict, cwd: str) -> None:
     ts = ev.get("ts") or time.time()
     rec["started"] = rec["started"] or ts
     rec["last"] = max(rec["last"], ts)
+    rec.setdefault("decisions", [])
+    rec.setdefault("handoff_from", "")
     if cwd and cwd != rec["cwd"]:
         rec["cwd"] = cwd
-        rec["project"] = project_root(cwd)
+        root = project_root(cwd)
+        if root != rec["project"]:
+            rec["project"] = root
+            _dirty(rec)["project"] = True
     kind = ev["kind"]
-    if kind == "user":
+    if kind == "handoff_in":
+        rec["handoff_from"] = ev["handoff"]
+        _dirty(rec)["handoff"] = ev["handoff"]
+        if not rec["goal"]:
+            rec["goal"] = f"continue a handed-over session ({ev['handoff']})"
+        rec["turns"] += 1
+    elif kind == "user":
         text = redact(ev["text"])
         if not rec["goal"]:
             rec["goal"] = _clip(text, 240)
         rec["requests"] = (rec["requests"] + [_clip(text, 400)])[-8:]
         rec["turns"] += 1
+        decided = decision_text(text, rec["open_thread"])
         rec["open_thread"] = ""
+        if decided and all(d["text"] != decided for d in rec["decisions"]):
+            rec["decisions"] = (rec["decisions"] + [{"text": decided, "ts": ts}])[-10:]
+            _dirty(rec)["decisions"].append(decided)
     elif kind == "assistant":
         text = redact(ev["text"])
         rec["last_agent"] = _clip(text, 1200)
@@ -376,6 +460,8 @@ def apply_event(rec: dict, ev: dict, cwd: str) -> None:
             entry = rec["files"].setdefault(f, {"edits": 0, "last": 0.0})
             entry["edits"] += 1
             entry["last"] = ts
+            if f not in _dirty(rec)["files"]:
+                _dirty(rec)["files"].append(f)
         cmd = redact(ev.get("command") or "")
         if cmd:
             if kind == "tool_status" and rec["commands"] and rec["commands"][-1]["cmd"] == _clip(cmd, 300):
@@ -464,33 +550,63 @@ class SessionStore:
                 out.append(rec)
         return out
 
+    @staticmethod
+    def project_node_id(root: str) -> str:
+        return f"PRJ-{hashlib.sha1(root.lower().encode()).hexdigest()[:10]}"
+
     def save(self, rec: dict) -> None:
-        title = f"{AGENT_LABELS.get(rec['agent'], rec['agent'])} · {project_name(rec['project'])}" \
-                f" · {_clip(rec['goal'], 70)}"
+        """Persist the record; graph nodes are written only for what changed."""
+        dirty = rec.pop("_dirty", None)
+        is_new = self.store.get_node(rec["id"]) is None
+        if is_new:   # first save of this session: everything it holds is new
+            dirty = {"files": list(rec["files"]), "decisions": [d["text"] for d in rec.get("decisions", [])],
+                     "project": True, "handoff": rec.get("handoff_from", "")}
+        dirty = dirty or {"files": [], "decisions": [], "project": False, "handoff": ""}
+        label = AGENT_LABELS.get(rec["agent"], rec["agent"])
+        title = f"{label} · {project_name(rec['project'])} · {_clip(rec['goal'], 70)}"
         content = "\n".join(filter(None, [
-            rec["goal"], *rec["requests"][-4:], " ".join(Path(f).name for f in rec["files"]),
+            rec["goal"], *rec["requests"][-4:], " ".join(Path(f).name for f in list(rec["files"])[-40:]),
             rec["digest"],
         ]))
-        if self.store.get_node(rec["id"]):
-            self.store.update_node(rec["id"], title=title, content=content, metadata=rec,
-                                   project=rec["project"])
-        else:
+        if is_new:
             self.store.add_node(content, type="agent_session", title=title, node_id=rec["id"],
                                 importance=0.6, project=rec["project"], source=rec["agent"],
                                 metadata=rec)
-        if rec["project"]:
-            pid = f"PRJ-{hashlib.sha1(rec['project'].lower().encode()).hexdigest()[:10]}"
+        else:
+            self.store.update_node(rec["id"], title=title, content=content, metadata=rec,
+                                   project=rec["project"])
+        if rec["project"] and dirty["project"]:
+            pid = self.project_node_id(rec["project"])
             if not self.store.get_node(pid):
                 self.store.add_node(rec["project"], type="project", title=project_name(rec["project"]),
                                     node_id=pid, importance=0.7, project=rec["project"], source="tracker")
             self.store.link(rec["id"], pid, "in", strength=0.8, source="tracker")
-        for f, info in rec["files"].items():
+        for text in dirty["decisions"]:
+            did = f"DEC-{hashlib.sha1((rec['id'] + text).encode()).hexdigest()[:12]}"
+            if self.store.get_node(did):
+                continue
+            self.store.add_node(text, type="decision", title=_clip(text, 80), node_id=did,
+                                project=rec["project"], source=rec["agent"], importance=0.7,
+                                metadata={"session": rec["id"], "agent": rec["agent"]})
+            self.store.link(rec["id"], did, "decided", strength=0.8, source="tracker")
+            if rec["project"]:
+                self.store.link(did, self.project_node_id(rec["project"]), "about", strength=0.7, source="tracker")
+        if dirty["handoff"]:
+            h = self.store.get_node(dirty["handoff"])
+            if h and h["type"] == "handoff":
+                self.store.link(rec["id"], h["id"], "continues", strength=0.9, source="tracker")
+                meta = dict(h["metadata"], to_session=rec["id"], picked_up_at=time.time())
+                self.store.update_node(h["id"], metadata=meta)
+        for f in dirty["files"]:
+            info = rec["files"].get(f)
+            if info is None:
+                continue
             fid = f"F-{hashlib.sha1(f.lower().encode()).hexdigest()[:12]}"
             if not self.store.get_node(fid):
                 self.store.add_node(f, type="file", title=Path(f).name, node_id=fid,
                                     project=rec["project"], source="tracker")
             aid = f"A-{rec['id'][2:]}-{fid[2:]}"
-            content = f"{AGENT_LABELS.get(rec['agent'], rec['agent'])} edited {f} ({info['edits']}x)"
+            content = f"{label} edited {f} ({info['edits']}x)"
             if self.store.get_node(aid):
                 self.store.update_node(aid, content=content)
             else:
@@ -548,6 +664,36 @@ class SessionStore:
         out.sort(key=lambda s: -s["last"])
         return out[:limit]
 
+    def forget(self, target: str) -> dict:
+        """
+        Remove a session (by id) or everything tracked in a project folder: the
+        sessions and their activity, open threads, digests, decisions and
+        handoffs, plus the project's file nodes.
+        """
+        if target.startswith("S-"):
+            recs = [r for r in [self.load(target)] if r]
+            project = ""
+        else:
+            project = project_root(target)
+            recs = [r for r in self.all() if (r.get("project") or "").lower() == project.lower()]
+        ids: list[str] = []
+        for rec in recs:
+            stem = rec["id"][2:]
+            ids.append(rec["id"])
+            ids += self.store._ids_where(
+                "id LIKE ? OR id LIKE ? OR id = ? OR id LIKE ?",
+                (f"A-{stem}-%", f"H-{stem}-%", f"OT-{stem}", f"D-{stem}"))
+            ids += [n["id"] for n in self._linked(rec["id"], "decision")]
+        if project:
+            ids += self.store._ids_where("project = ? AND type IN ('file', 'project')", (project,))
+        ids = list(dict.fromkeys(ids))
+        self.store._delete_nodes(ids)
+        return {"sessions": len(recs), "nodes": len(ids)}
+
+    def _linked(self, node_id: str, type_: str) -> list[dict]:
+        nbrs = [e["dst"] for e in self.store.neighbors(node_id) if not e.get("reverse")]
+        return [n for n in self.store.get_nodes(nbrs).values() if n["type"] == type_]
+
     def threads(self, project: str = "", limit: int = 10) -> list[dict]:
         return [
             {"session": s["id"], "agent": s["label"], "project_name": s["project_name"],
@@ -574,6 +720,9 @@ class SessionTracker:
         self._running = False
         self._lock = threading.Lock()
         self.errors: dict[str, str] = {}      # source -> last read problem, shown to clients
+        self.ignored = _ignored_roots()
+        self.keep_days = float(os.getenv("SHADOW_TRACK_KEEP_DAYS", "30") or 30)
+        self._last_prune = 0.0
 
     def start(self) -> None:
         if self._running:
@@ -663,12 +812,29 @@ class SessionTracker:
                         apply_event(rec, ev, parser.cwd)
                     changed[sid] = rec
                 cur["state"] = parser.snapshot()
-            for sid, rec in changed.items():
+            for sid, rec in list(changed.items()):
+                if is_ignored(rec["project"], self.ignored):
+                    changed.pop(sid)
+                    self._records.pop(sid, None)
+                    continue
                 self._records[sid] = rec
                 self.sessions.save(rec)
             self._write_digests(now)
             self.store.set_meta(_CURSOR_KEY, self._cursors)
+            if now - self._last_prune > 86400:
+                self.prune(now)
         return list(changed)
+
+    def prune(self, now: float | None = None) -> dict:
+        """Drop raw activity older than keep_days; sessions, digests, decisions stay."""
+        now = now or time.time()
+        self._last_prune = now
+        cutoff = now - self.keep_days * 86400
+        old = self.store._ids_where(
+            "type = 'activity' AND created_at < ? AND COALESCE(last_used_at, 0) < ?", (cutoff, cutoff))
+        removed = self.store._delete_nodes(old)
+        events = self.store.prune_events(self.keep_days)
+        return {"activity": removed, "events": events}
 
     def _write_digests(self, now: float) -> None:
         """Quiet sessions get a template digest until a client writes a better one."""
@@ -678,6 +844,41 @@ class SessionTracker:
                 fresh = self.sessions.load(rec["id"])
                 if fresh:
                     rec.update(fresh)
+
+    def rebuild(self) -> int:
+        """
+        Re-read every session file from the start, after the way sessions are
+        read has improved. Records, activity, open threads and decisions are
+        rebuilt; summaries a model wrote and handoffs are kept.
+        """
+        with self._lock:
+            kept = {r["id"]: (r["digest"], r["digest_by"], r.get("digest_at", 0.0))
+                    for r in self.sessions.all() if r.get("digest_by") not in ("", "template")}
+            derived = self.store._ids_where(
+                "type IN ('agent_session', 'activity', 'open_thread') OR (type = 'digest' AND source = 'template')"
+                " OR (type = 'decision' AND id LIKE 'DEC-%')")
+            self.store._delete_nodes(derived)
+            self._cursors, self._parsers, self._records = {}, {}, {}
+            self.store.set_meta(_CURSOR_KEY, {})
+        self.poll_once()
+        with self._lock:
+            for sid, (digest, by, at) in kept.items():
+                rec = self.sessions.load(sid)
+                if rec is not None:
+                    rec.update(digest=digest, digest_by=by, digest_at=at)
+                    self.sessions.save(rec)
+                    self._records[sid] = rec
+        return len(self.sessions.all())
+
+    def forget(self, target: str) -> dict:
+        """`SessionStore.forget`, also dropping the poll loop's copies so nothing comes back."""
+        with self._lock:
+            out = self.sessions.forget(target)
+            root = "" if target.startswith("S-") else project_root(target).lower()
+            for sid, rec in list(self._records.items()):
+                if sid == target or (root and (rec.get("project") or "").lower() == root):
+                    self._records.pop(sid)
+            return out
 
     def set_digest(self, session_id: str, text: str, by: str) -> dict | None:
         """Store a client's digest without racing the poll loop's own save."""
@@ -738,6 +939,9 @@ def build_handoff(store: CognitiveStore, session_id: str, to_agent: str = "") ->
         lines += ["", f"Last tests: `{_clip(t['cmd'], 110)}` {'passed' if t['status'] == 'ok' else 'FAILED'}"]
     if rec["errors"]:
         lines += ["", "## Recent errors"] + [f"- {_clip(e['what'], 120)}" for e in rec["errors"][-3:]]
+    if rec.get("decisions"):
+        lines += ["", "## Decisions the user made"]
+        lines += [f"- {_clip(d['text'], 160)}" for d in rec["decisions"][-4:]]
     if rec["requests"]:
         lines += ["", "## What the user asked most recently"]
         lines += [f"- {_clip(r, 160)}" for r in rec["requests"][-3:]]
@@ -745,9 +949,14 @@ def build_handoff(store: CognitiveStore, session_id: str, to_agent: str = "") ->
         lines += ["", f"## {label}'s last reply", _clip(rec["last_agent"], 360)]
     if rec["open_thread"]:
         lines += ["", f"Open question: {rec['open_thread']}"]
-    lines += ["", "Continue this work: check the files above, then pick up from the last request."]
-    text = redact("\n".join(lines))
+    if rec.get("handoff_from"):
+        prev = store.get_node(rec["handoff_from"])
+        if prev:
+            lines += ["", f"(That session itself continued earlier work: {prev['title']}.)"]
     hid = f"H-{rec['id'][2:]}-{int(time.time())}"
+    lines += ["", "Continue this work: check the files above, then pick up from the last request.",
+              f"_(Shadow handoff {hid})_"]
+    text = redact("\n".join(lines))
     store.add_node(text, type="handoff", title=f"handoff from {label}: {_clip(rec['goal'], 50)}",
                    node_id=hid, project=rec["project"], source="shadow",
                    metadata={"from": rec["id"], "to_agent": to_agent, "at": time.time()})

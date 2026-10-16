@@ -79,13 +79,17 @@ The plugin lives in [`plugin/`](plugin/).
 
 ## Shadow across your agents
 
-`shadow-link daemon` keeps track of what every coding agent is doing: Claude Code, Codex CLI and Antigravity CLI. It reads each agent's own session files as they grow, records per session what you asked, files changed, commands and tests (pass or fail), errors and the question it left open, and keeps it in Shadow's memory (the ACA graph) with your past replies. Credentials are redacted before anything is stored. See [`docs/SHADOW_CORE_PLAN.md`](docs/SHADOW_CORE_PLAN.md).
+`shadow-link daemon` keeps track of what every coding agent is doing: Claude Code, Codex CLI, Antigravity CLI and the Antigravity IDE. It reads each agent's own session files as they grow, records per session what you asked, the decisions you made, files changed, commands and tests (pass or fail), errors and the question it left open, and keeps it in Shadow's memory (the ACA graph) with your past replies. Credentials are redacted before anything is stored, and pasted terminal output or logs are never mistaken for your own words. See [`docs/SHADOW_CORE_PLAN.md`](docs/SHADOW_CORE_PLAN.md).
 
 Handing work over is always on request, and Shadow never sends anything to an agent itself:
 
 - **In Claude Code:** `hand over` in the sidebar, or `/shadow handoff codex`, puts a short brief (goal, where it stands, files, commands, tests, errors, your last requests) in the chat bar.
 - **In Codex or Antigravity:** run `shadow-link connect` once. It adds Shadow's MCP server to `~/.codex/config.toml` and `~/.gemini/config/mcp_config.json` (backing them up first). Then ask, for example, "what is Claude doing? use shadow_sessions" or "pick up the Claude session with shadow_handoff".
 - **Anywhere:** `shadow-link sessions` lists them; `shadow-link handoff <id> --to-file` writes `.shadow/handoff.md` for any agent to read.
+
+When a brief is sent on, Shadow links the session that picked it up to the one it came from, so later questions can follow the chain.
+
+**Privacy and upkeep:** `tracking.ignore` in `config.json` lists folders that are never recorded, and `tracking.enabled: false` turns tracking off. `shadow-link forget <session id | project folder>` removes what was recorded. Raw activity older than `tracking.keep_activity_days` (30) is pruned daily; sessions, summaries and decisions stay. After upgrading Shadow Link, `shadow-link sessions --rebuild` re-reads every session with the new rules.
 
 ## Quick start
 
@@ -115,7 +119,8 @@ shadow-link ingest-sessions --only codex agy
 | Command | What it does |
 |---|---|
 | `shadow-link daemon` | Start the local API, the live transcript watcher, and tracking of every agent's sessions. |
-| `shadow-link sessions [--project dir] [--agent codex] [--active]` | List what every coding agent is doing. |
+| `shadow-link sessions [--project dir] [--agent codex] [--active]` | List what every coding agent is doing. `--rebuild` re-reads all session files after an upgrade. |
+| `shadow-link forget <session id \| folder>` | Remove a tracked session, or everything tracked in a project. |
 | `shadow-link handoff <session> [--to-file]` | Print (or write to `.shadow/handoff.md`) a brief to continue that session's work. |
 | `shadow-link connect [codex\|antigravity]` | Give Codex / Antigravity Shadow's MCP tools. `--dry-run` shows the change first. |
 | `shadow-link reclassify` | Re-sort stored replies with the current categorizer. |
@@ -123,7 +128,7 @@ shadow-link ingest-sessions --only codex agy
 | `shadow-link query <text>` | Search stored replies. |
 | `shadow-link interactive` | Run the fast-reply simulator. |
 | `shadow-link ingest-claude-export <file>` | Import reaction pairs from a Claude.ai export. |
-| `shadow-link ingest-sessions [--only claude codex agy]` | Import reaction pairs from Claude Code, Codex CLI and Antigravity CLI histories. |
+| `shadow-link ingest-sessions [--only claude codex agy agy-ide]` | Import reaction pairs from Claude Code, Codex CLI, Antigravity CLI and Antigravity IDE histories. |
 | `shadow-link mcp` | Run the stdio MCP server. |
 | `shadow-link aca <text> [--task id] [--kind error]` | Associative Context Activation: show what an event activates, why, and the decision signals. |
 | `shadow-link aca --replay --task <id>` | Replay everything ACA did for a task. |
@@ -282,7 +287,7 @@ ACA asks *"what does this event activate?"* instead of *"what should I search fo
 
 ## API
 
-`shadow-link daemon` starts the JSON API at `http://localhost:5000` by default. The Claude Code plugin and other local clients use it for predictions, feedback, ingestion, live state, and agent sessions (`GET /sessions`, `GET /sessions/<id>`, `GET /threads`, `POST /track/event`, `POST /sessions/<id>/digest`, `POST /handoff`).
+`shadow-link daemon` starts the JSON API at `http://localhost:5000` by default. The Claude Code plugin and other local clients use it for predictions, feedback, ingestion, live state, and agent sessions (`GET /sessions`, `GET /sessions/<id>`, `GET /threads`, `POST /track/event`, `POST /sessions/<id>/digest`, `POST /handoff`, `POST /forget`, `POST /sessions/rebuild`).
 
 The API has no authentication. It only answers requests addressed to localhost and refuses requests from web pages (any `Origin` header) and non-JSON POSTs. Keep it bound to localhost.
 

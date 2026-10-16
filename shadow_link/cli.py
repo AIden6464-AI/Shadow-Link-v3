@@ -94,14 +94,14 @@ def handle_ingest_claude_export(args):
 
 def handle_ingest_sessions(args):
     _, _, _, ingester = get_services()
-    sources = tuple(args.only) if args.only else ("claude", "codex", "agy")
+    sources = tuple(args.only) if args.only else ("claude", "codex", "agy", "agy-ide")
     print(f"Importing reaction pairs from agent CLI histories: {', '.join(sources)}")
     try:
         report = ingester.ingest_agent_sessions(sources)
     except Exception as e:
         print(f"Error during import: {e}", file=sys.stderr)
         sys.exit(1)
-    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI"}
+    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI", "agy-ide": "Antigravity IDE"}
     for src, r in report.items():
         print(f"  {labels[src]:<16} {r['sessions']:>4} sessions  {r['imported']:>5} new pairs  "
               f"({r['skipped']} already stored)")
@@ -129,7 +129,20 @@ def handle_sessions(args):
     from shadow_link.aca.store import CognitiveStore
     from shadow_link.tracker import SessionStore, SessionTracker
     config = Config()
-    if args.scan:
+    if args.rebuild:
+        print("Re-reading every agent's session files from the start...")
+        count = None
+        try:   # a running daemon rebuilds itself, so its own copies stay in step
+            import urllib.request
+            port = os.environ.get("SHADOW_LINK_PORT", "5000")
+            req = urllib.request.Request(f"http://localhost:{port}/sessions/rebuild", b"{}",
+                                         {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                count = json.loads(resp.read()).get("sessions")
+        except Exception:
+            count = SessionTracker(config.db_path).rebuild()
+        print(f"Rebuilt {count} session(s).")
+    elif args.scan:
         SessionTracker(config.db_path).poll_once()
     items = SessionStore(CognitiveStore(config.db_path)).list(
         project=args.project or "", agent=args.agent or "", active_only=args.active, limit=args.limit)
@@ -157,6 +170,31 @@ def handle_handoff(args):
         print(f"Wrote {out}. Point any agent at it to continue.")
     else:
         print(packet["markdown"])
+
+
+def handle_forget(args):
+    target = args.target
+    what = f"session {target}" if target.startswith("S-") else f"everything tracked in {Path(target).resolve()}"
+    if not args.yes:
+        confirm = input(f"Forget {what}? This cannot be undone. [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Canceled.")
+            return
+    if not target.startswith("S-"):
+        target = str(Path(target).resolve())
+    out = None
+    try:   # a running daemon must drop its own copies too
+        import urllib.request
+        port = os.environ.get("SHADOW_LINK_PORT", "5000")
+        req = urllib.request.Request(f"http://localhost:{port}/forget", json.dumps({"target": target}).encode(),
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out = json.loads(resp.read())
+    except Exception:
+        from shadow_link.aca.store import CognitiveStore
+        from shadow_link.tracker import SessionStore
+        out = SessionStore(CognitiveStore(Config().db_path)).forget(target)
+    print(f"Forgot {out['sessions']} session(s) ({out['nodes']} memory nodes).")
 
 
 def handle_connect(args):
@@ -288,10 +326,15 @@ def handle_start_api(args):
 
     # Shadow Core: one memory, and every agent's sessions tracked into it.
     _sync_memory()
-    import shadow_link.tracker as tracker_mod
-    tracker_mod.TRACKER = tracker_mod.SessionTracker(config.db_path)
-    tracker_mod.TRACKER.start()
-    print("[Shadow Link Daemon] Tracking Claude Code, Codex and Antigravity sessions...")
+    if os.environ.get("SHADOW_TRACK", "1") not in ("0", "false", "False"):
+        import shadow_link.tracker as tracker_mod
+        tracker_mod.TRACKER = tracker_mod.SessionTracker(config.db_path)
+        tracker_mod.TRACKER.start()
+        ignored = tracker_mod.TRACKER.ignored
+        print("[Shadow Link Daemon] Tracking Claude Code, Codex and Antigravity sessions"
+              + (f" (ignoring {len(ignored)} folder(s))" if ignored else "") + "...")
+    else:
+        print("[Shadow Link Daemon] Agent tracking is off (tracking.enabled = false).")
 
     # Start transparent proxy in background if requested
     if getattr(args, "proxy", False):
@@ -415,7 +458,7 @@ def main():
 
     # Agent CLI histories (Claude Code, Codex CLI, Antigravity CLI)
     sessions_parser = subparsers.add_parser("ingest-sessions", help="Import reaction pairs from Claude Code, Codex CLI and Antigravity CLI histories")
-    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy"], help="Limit to these sources")
+    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy", "agy-ide"], help="Limit to these sources")
     sessions_parser.set_defaults(func=handle_ingest_sessions)
 
     sess_parser = subparsers.add_parser("sessions", help="List what every coding agent is doing (Claude Code, Codex, Antigravity)")
@@ -424,6 +467,8 @@ def main():
     sess_parser.add_argument("--active", action="store_true", help="Only sessions active in the last 10 minutes")
     sess_parser.add_argument("--limit", type=int, default=15)
     sess_parser.add_argument("--scan", action="store_true", help="Read new session activity first (without the daemon)")
+    sess_parser.add_argument("--rebuild", action="store_true",
+                             help="Re-read all session files from the start (after an upgrade); keeps model summaries")
     sess_parser.set_defaults(func=handle_sessions)
 
     handoff_parser = subparsers.add_parser("handoff", help="Build a handoff brief from one agent session")
@@ -431,6 +476,11 @@ def main():
     handoff_parser.add_argument("--to", help="The agent taking over (recorded with the handoff)")
     handoff_parser.add_argument("--to-file", action="store_true", help="Write .shadow/handoff.md in the current folder")
     handoff_parser.set_defaults(func=handle_handoff)
+
+    forget_parser = subparsers.add_parser("forget", help="Remove a tracked session, or everything tracked in a project folder")
+    forget_parser.add_argument("target", help="A session id (S-...) from `shadow-link sessions`, or a project folder")
+    forget_parser.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    forget_parser.set_defaults(func=handle_forget)
 
     connect_parser = subparsers.add_parser("connect", help="Give Codex / Antigravity Shadow's MCP tools (sessions, recall, handoff)")
     connect_parser.add_argument("agent", nargs="?", default="all", choices=["all", "codex", "antigravity"])

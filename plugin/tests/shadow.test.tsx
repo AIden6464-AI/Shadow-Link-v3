@@ -34,7 +34,7 @@ const ANTIGRAVITY = {
 }
 const HANDOFF = '# Handoff from Codex: veyr\n\nGoal: make the admin page show model costs'
 
-function fakes(on: On, opts: { isDown?: boolean; forkThrows?: boolean; badJson?: boolean; draft?: string; gate?: { started: () => void; open: Promise<void> }; sessions?: any[] } = {}): Calls {
+function fakes(on: On, opts: { isDown?: boolean; forkThrows?: boolean; badJson?: boolean; draft?: string; gate?: { started: () => void; open: Promise<void> }; sessions?: any[]; problems?: Record<string, string> } = {}): Calls {
   const calls: Calls = { fetches: [], suggested: [], filled: [], forks: [], opened: [], status: [], drafts: [] }
   // The ghost model: unavailable unless a test gives it a draft, so Shadow falls back to past replies.
   on('model.complete', async ($, e) => {
@@ -90,11 +90,11 @@ function fakes(on: On, opts: { isDown?: boolean; forkThrows?: boolean; badJson?:
         : path === '/aca/event'
           ? { context: [{ title: 'you rejected Docker for dev', type: 'reaction', content: 'use the venv', situation: SITUATION, why: { seed_reason: 'lexical match 0.55' } }] }
           : path === '/stats'
-            ? { total_prompts: 1204 }
+            ? { total_prompts: 1204, database_bytes: 3 * 1048576 }
             : path === '/ingest'
               ? { status: 'ingested', prompt_id: 42 }
               : path === '/sessions'
-                ? { sessions: opts.sessions ?? [] }
+                ? { sessions: opts.sessions ?? [], problems: opts.problems ?? {} }
                 : path === '/threads'
                   ? { threads: (opts.sessions ?? []).filter(s => s.open_thread).map(s => ({ session: s.id, agent: s.label, project_name: s.project_name, text: s.open_thread })) }
                   : path === '/handoff'
@@ -387,6 +387,29 @@ test('a quiet session gets a model-written summary, once', async ($, on) => {
   expect(digest?.body.text).toContain('model costs')
   const summaryPrompt = calls.drafts.find(d => d.system?.includes('summarise one coding-agent session'))
   expect(summaryPrompt?.prompt).toContain('Files changed: D:\\veyr\\chat.html')
+})
+
+test('a question naming an agent brings that session\'s full timeline', async ($, on) => {
+  const calls = fakes(on, { sessions: [ANTIGRAVITY, { ...CODEX, needs_digest: false }] })
+  await claudeReplies($)
+  const ui = await sidebar($, 'terminal')
+  await ui.input({ key: 'ask', text: 'what did codex do in veyr today?' })
+  expect(calls.forks[0]).toContain('Detail for the sessions this question is about')
+  expect(calls.forks[0]).toContain('files changed: D:\\veyr\\chat.html (2x)')
+  expect(calls.forks[0]).toContain('commands: pytest')
+  expect(calls.fetches.some(f => f.url.endsWith(`/sessions/${CODEX.id}`))).toBe(true)
+  expect(calls.fetches.some(f => f.url.endsWith(`/sessions/${ANTIGRAVITY.id}`))).toBe(false)
+  await ui.unmount()
+})
+
+test('AGENTS says when an agent\'s sessions cannot be read; CORE MEMORY shows the size', async ($, on) => {
+  fakes(on, { sessions: [ANTIGRAVITY], problems: { codex: 'permission denied' } })
+  await claudeReplies($)
+  await $.prompt.submit({ text: 'keep going with it', wait: false, origin: { kind: 'composer' } })
+  const ui = await sidebar($, 'terminal')
+  expect(await ui.find({ type: 'Text', text: /can't read codex: permission denied/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /3\.0 MB/ })).toBeDefined()
+  await ui.unmount()
 })
 
 test('side questions know what the other agents are doing', async ($, on) => {
