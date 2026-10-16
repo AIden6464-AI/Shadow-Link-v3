@@ -1,44 +1,73 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ShadowAlt, ShadowAnswer, ShadowGhost, ShadowView, ShadowWhy } from '../types'
+import type { ShadowAlt, ShadowAnswer, ShadowGhost, ShadowStats, ShadowWhy } from '../types'
 
-// Shadow floats above the chat bar. After every Claude turn it asks the local
-// Shadow Link daemon how you would likely reply, shows that as a ghost you can
-// send with one key (and as dim text in the prompt box, Tab to take), explains
-// it on request, and answers side questions about the session without
-// touching the main conversation.
+// Shadow lives in a sidebar beside the conversation. After every Claude turn it
+// asks the local Shadow Link daemon how you would likely reply, shows that as a
+// ghost you can take with one key (and as dim text in the prompt box, Tab to
+// take), explains it on request, and answers side questions about the session
+// without touching the main conversation.
+
+const PANE = 'shadow'
 
 const ghostAtom = atom({ plugin: 'shadow-link', key: 'ghost' } as const, null as ShadowGhost | null)
 const situationAtom = atom({ plugin: 'shadow-link', key: 'situation' } as const, '')
-const viewAtom = atom({ plugin: 'shadow-link', key: 'view' } as const, 'ghost' as ShadowView)
 const whyAtom = atom({ plugin: 'shadow-link', key: 'why' } as const, null as ShadowWhy[] | null)
+const whyOpenAtom = atom({ plugin: 'shadow-link', key: 'isWhyOpen' } as const, false)
 const answerAtom = atom({ plugin: 'shadow-link', key: 'answer' } as const, null as ShadowAnswer | null)
 const onlineAtom = atom({ plugin: 'shadow-link', key: 'isOnline' } as const, true)
-const hiddenAtom = atom({ plugin: 'shadow-link', key: 'isHidden' } as const, false)
+const waitingAtom = atom({ plugin: 'shadow-link', key: 'isWaiting' } as const, false)
+const statsAtom = atom({ plugin: 'shadow-link', key: 'stats' } as const, { corpus: null, learned: 0 } as ShadowStats)
+const recentAtom = atom({ plugin: 'shadow-link', key: 'recent' } as const, [] as string[])
+const draftingAtom = atom({ plugin: 'shadow-link', key: 'isDrafting' } as const, false)
 
-const OFFLINE_STATUS = '◐ shadow offline · run `shadow-link daemon`'
+// The Shadow Link terminal palette (docs/brand.md, shadow_link/tui.py).
+const THEME = {
+  signal: '#5ff26d', // marks, actions, the ghost
+  ok: '#74f288',
+  warn: '#f4c95d',
+  border: '#2fd94c',
+  bar: '#07110b',
+  ink: '#080d11',
+  text: '#dde5e3',
+  muted: '#a9bbb5',
+}
+
+const OFFLINE_STATUS = '⠇ shadow offline · run `shadow-link daemon`'
 
 // Options, set by register() on each load.
-let cfg = { baseUrl: 'http://localhost:5000', minConfidence: 0.15, suggestInPrompt: true }
+let cfg = { baseUrl: 'http://localhost:5000', minConfidence: 0.08, suggestInPrompt: true, ghostModel: 'haiku' }
 
-async function post($: EngineInterface, path: string, body: unknown): Promise<any | null> {
+/** The option a model drafted, as opposed to a past reply Shadow retrieved. */
+const DRAFTED = 'drafted'
+// The sidebar opens itself once per load, and only where it docks beside the transcript.
+let hasAutoOpened = false
+
+async function call($: EngineInterface, method: 'GET' | 'POST', path: string, body?: unknown): Promise<any | null> {
+  let res
   try {
-    const res = await $.http.fetch(`${cfg.baseUrl.replace(/\/$/, '')}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+    res = await $.http.fetch(`${cfg.baseUrl.replace(/\/$/, '')}${path}`, {
+      method,
+      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : {},
+      body: method === 'POST' ? JSON.stringify(body) : undefined,
     })
-    await update($, onlineAtom, () => true)
-    $.ui.status(undefined)
-    if (!res.ok) return null
-    return res.text ? JSON.parse(res.text) : {}
   } catch {
     await update($, onlineAtom, () => false)
     $.ui.status(OFFLINE_STATUS)
     return null
   }
+  await update($, onlineAtom, () => true)
+  $.ui.status(undefined)
+  if (!res.ok) return null
+  try {
+    return res.text ? JSON.parse(res.text) : {}
+  } catch {
+    return null // reachable, but not an answer we can read
+  }
 }
+
+const post = ($: EngineInterface, path: string, body: unknown) => call($, 'POST', path, body)
 
 const current = (g: ShadowGhost | null): ShadowAlt | null =>
   g && g.options.length ? g.options[g.index % g.options.length] ?? null : null
@@ -57,25 +86,92 @@ const toAlt = (raw: any): ShadowAlt | null =>
     : null
 
 // ---------------------------------------------------------------- actions
+async function refreshStats($: EngineInterface) {
+  const data = await call($, 'GET', '/stats')
+  if (data && typeof data.total_prompts === 'number') {
+    await update($, statsAtom, s => ({ ...s, corpus: data.total_prompts }))
+  }
+}
+
 async function clearTurn($: EngineInterface) {
   await update($, ghostAtom, () => null)
   await update($, whyAtom, () => null)
-  await update($, answerAtom, () => null)
-  await update($, viewAtom, () => 'ghost' as ShadowView)
+  await update($, whyOpenAtom, () => false)
+}
+
+const DRAFT_SYSTEM = [
+  'You predict the exact next message one specific person will type to their AI coding agent.',
+  'Write only that message: no quotes, no preamble, no explanation.',
+  'Match their voice exactly: length, casing, spelling, slang and punctuation, as their examples show.',
+  'Most of their messages are short. If the agent asked a question or offered options, answer it the way they would.',
+].join(' ')
+
+function draftPrompt(situation: string, examples: { situation: string; reply: string }[], recent: string[]) {
+  const shown = examples
+    .filter(x => x.reply.trim())
+    .slice(0, 8)
+    .map((x, i) => `${i + 1}. Agent: "${clip(x.situation.replace(/\s+/g, ' '), 240)}"\n   They replied: "${clip(x.reply, 300)}"`)
+    .join('\n')
+  const said = situation.length > 3000 ? `…${situation.slice(-3000)}` : situation
+  return [
+    shown ? `How this person replied to their agent before:\n${shown}` : '',
+    recent.length ? `Their latest messages in this session, oldest first:\n${recent.map(r => `- ${clip(r, 300)}`).join('\n')}` : '',
+    `The agent (Claude) just said:\n"""\n${said}\n"""`,
+    'Write their next message.',
+  ].filter(Boolean).join('\n\n')
+}
+
+async function draft($: EngineInterface, situation: string, examples: any[]): Promise<string | null> {
+  const recent = await read($, recentAtom)
+  try {
+    const r = await $.model.complete({
+      model: cfg.ghostModel,
+      system: DRAFT_SYSTEM,
+      prompt: draftPrompt(situation, Array.isArray(examples) ? examples : [], recent),
+      maxTokens: 120,
+      timeoutMs: 20000,
+    })
+    if (!r.isAnswered) return null
+    const text = r.text.trim().replace(/^["'“]+|["'”]+$/g, '').trim()
+    return text || null
+  } catch {
+    return null
+  }
 }
 
 async function predict($: EngineInterface, situation: string) {
-  const data = await post($, '/predict', { question: situation })
-  const all = [data?.ghost, ...(data?.alternates ?? [])]
+  const useModel = cfg.ghostModel !== 'off'
+  const data = await post($, '/predict', { question: situation, examples: useModel ? 8 : 0 })
+  const retrieved = [data?.ghost, ...(data?.alternates ?? [])]
     .map(toAlt)
-    .filter((a): a is ShadowAlt => a !== null && a.confidence >= cfg.minConfidence)
-  const ghost: ShadowGhost | null = all.length ? { situation, options: all, index: 0 } : null
+    .filter((a): a is ShadowAlt => a !== null && a.bucket !== 'generated' && a.confidence >= cfg.minConfidence)
+
+  let options = retrieved
+  if (useModel) {
+    await update($, draftingAtom, () => true)
+    await update($, ghostAtom, () => null)
+    const text = await draft($, situation, data?.examples ?? [])
+    await update($, draftingAtom, () => false)
+    // A newer turn has started (or the person already sent): this draft is stale.
+    if ((await read($, situationAtom)) !== situation || (await read($, waitingAtom))) return
+    if (text) {
+      options = [{ id: null, text, confidence: 1, bucket: DRAFTED }, ...retrieved.filter(a => a.text !== text)]
+    }
+  }
+
+  const ghost: ShadowGhost | null = options.length ? { situation, options, index: 0 } : null
   await update($, ghostAtom, () => ghost)
   const top = current(ghost)
   if (top && cfg.suggestInPrompt) {
     await $.prompt.suggest({ text: top.text }).catch(() => undefined)
   }
 }
+
+/** One line on where a guess came from. */
+const describe = (alt: ShadowAlt) =>
+  alt.bucket === DRAFTED
+    ? `drafted by ${cfg.ghostModel} in your voice`
+    : `${alt.confidence >= 0.55 ? 'high' : alt.confidence >= 0.3 ? 'medium' : 'low'} · ${Math.round(alt.confidence * 100)}% · past reply`
 
 async function useGhost($: EngineInterface, text: string) {
   // Put it in the chat bar to send (or edit first); feedback is learned when it is sent.
@@ -91,13 +187,18 @@ async function markWrong($: EngineInterface) {
   }
   const rest = g.options.filter((_, i) => i !== g.index % g.options.length)
   await update($, ghostAtom, () => (rest.length ? { ...g, options: rest, index: 0 } : null))
+  await update($, whyOpenAtom, () => false)
   $.ui.toast('Shadow will weigh that reply less here')
 }
 
 async function explain($: EngineInterface) {
   const g = await read($, ghostAtom)
   if (!g) return
-  await update($, viewAtom, () => 'why' as ShadowView)
+  if (await read($, whyOpenAtom)) {
+    await update($, whyOpenAtom, () => false)
+    return
+  }
+  await update($, whyOpenAtom, () => true)
   await update($, whyAtom, () => null)
   const data = await post($, '/aca/event', {
     text: g.situation,
@@ -116,7 +217,6 @@ async function explain($: EngineInterface) {
 async function ask($: EngineInterface, question: string) {
   const q = question.trim()
   if (!q) return
-  await update($, viewAtom, () => 'answer' as ShadowView)
   await update($, answerAtom, () => ({ question: q, text: '', isPending: true }))
 
   // The user's own history, from Shadow Link's memory, rides along with the question.
@@ -145,56 +245,65 @@ async function ask($: EngineInterface, question: string) {
 
   // A fork reads the session's own transcript (served from the prompt cache)
   // without adding anything to it.
-  const r = await $.model.fork({ prompt })
-  const text = r.isAnswered
-    ? r.text.trim()
-    : r.reason === 'nothing-to-fork'
-      ? 'Nothing to go on yet: ask again after Claude has replied once.'
-      : `Shadow could not answer (${r.reason}).`
+  let text: string
+  try {
+    const r = await $.model.fork({ prompt })
+    text = r.isAnswered
+      ? r.text.trim()
+      : r.reason === 'nothing-to-fork'
+        ? 'Nothing to go on yet: ask again after Claude has replied once.'
+        : `Shadow could not answer (${r.reason}).`
+  } catch {
+    text = 'Shadow could not answer (error).'
+  }
   await update($, answerAtom, () => ({ question: q, text, isPending: false }))
 }
 
+const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Shadow', columns: 38 })
 
 export const register: Register = (on, options) => {
   cfg = {
     baseUrl: String(options.daemon_url ?? 'http://localhost:5000'),
-    minConfidence: Number(options.min_confidence ?? 0.15),
+    minConfidence: Number(options.min_confidence ?? 0.08),
     suggestInPrompt: options.suggest_in_prompt !== false,
+    ghostModel: String(options.ghost_model ?? 'haiku').trim() || 'haiku',
   }
+  hasAutoOpened = false
 
   // ----------------------------------------------------------------- events
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'shadow',
-      description: 'Shadow: show/hide the floating ghost, or `/shadow <question>` to ask about this session.',
+      description: 'Open the Shadow sidebar, `/shadow <question>` to ask about this session, `/shadow status` to check the daemon.',
     })
+    void refreshStats($).catch(() => undefined)
     return next(e)
   })
 
   on('command.run', { command: 'shadow' }, async ($, e) => {
     const args = e.args.trim()
-    if (!args || args === 'toggle') {
-      const hidden = await update($, hiddenAtom, h => !h)
-      return { text: hidden ? 'Shadow hidden. /shadow to show it again.' : 'Shadow is back above the chat bar.' }
-    }
     if (args === 'status') {
       const online = await read($, onlineAtom)
       return { text: online ? `Shadow is linked to ${cfg.baseUrl}.` : `Shadow can't reach ${cfg.baseUrl}. Run: shadow-link daemon` }
     }
-    await update($, hiddenAtom, () => false)
+    await openPane($)
+    if (!args || args === 'open') return { text: 'Shadow sidebar open.' }
     await ask($, args)
     // A command's output row is read by the model too: keep the side answer in
-    // the band and out of the main conversation.
-    return { text: 'Shadow answered above the chat bar.' }
+    // the sidebar and out of the main conversation.
+    return { text: 'Shadow answered in its sidebar.' }
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    // Main conversation only: subagent runs and interrupted turns get no ghost.
-    if (e.agentId === undefined && !e.isAborted && e.answer.trim()) {
-      await clearTurn($)
-      await update($, situationAtom, () => e.answer)
-      await predict($, e.answer)
+    // Main conversation only: subagent runs get no ghost.
+    if (e.agentId === undefined) {
+      await update($, waitingAtom, () => false)
+      if (!e.isAborted && e.answer.trim()) {
+        await clearTurn($)
+        await update($, situationAtom, () => e.answer)
+        await predict($, e.answer)
+      }
     }
     return result
   })
@@ -210,135 +319,211 @@ export const register: Register = (on, options) => {
 
   // Learn from what the person actually sends.
   on('prompt.submit', async ($, e, next) => {
-    // `@shadow <question>` in the chat bar goes to Shadow, never to Claude.
-    const toShadow = e.origin.kind === 'composer' ? /^@shadow\b\s*([\s\S]*)$/i.exec(e.text.trim()) : null
-    if (toShadow) {
-      const question = (toShadow[1] ?? '').trim()
-      await update($, hiddenAtom, () => false)
-      if (question) {
-        $.clock.after(0, async () => {
-          await $.prompt.fill({ text: '', mode: 'replace' }) // the question was for Shadow: clear the bar
-          await ask($, question)
-        })
-      }
-      return { drop: question ? 'Asked Shadow: the answer floats above the chat bar.' : 'Type @shadow followed by a question.' }
-    }
     if (e.origin.kind === 'composer') {
       const text = e.text.trim()
       const situation = await read($, situationAtom)
       const g = await read($, ghostAtom)
-      if (text && situation) {
-        await post($, '/ingest', { question: situation, response: text, request_id: `claude-code-${Date.now()}` })
+      if (text && !text.startsWith('/')) {
+        await update($, recentAtom, r => [...r, text].slice(-6))
+      }
+      if (text && situation && !text.startsWith('/')) {
+        const stored = await post($, '/ingest', { question: situation, response: text, request_id: `claude-code-${Date.now()}` })
+        if (typeof stored?.prompt_id === 'number') await update($, statsAtom, s => ({ corpus: s.corpus, learned: s.learned + 1 }))
         const sent = g?.options.find(o => o.text === text)
         if (sent && sent.id !== null) {
           await post($, '/feedback', { id: sent.id, vote: 'up', situation })
         }
+        await refreshStats($)
       }
       await clearTurn($)
+      await update($, waitingAtom, () => true)
     }
     return next(e)
   }).catch(($, e, next) => next(e)) // learning must never hold up a prompt
 
-  // --------------------------------------------------------------- the band
+  // Fullscreen: open the sidebar once, beside the transcript. Main screen: no
+  // room for a sidebar, so a two-row strip above the chat bar carries the ghost
+  // and `more` opens the full panel inline.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // The band is drawn on the terminal and desktop surfaces only.
+    if (e.viewport?.isFullscreen === true) {
+      if (!hasAutoOpened) {
+        hasAutoOpened = true
+        void openPane($).catch(() => undefined)
+      }
+      return next(e)
+    }
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
-    if (e.props.hasSurvey || (await read($, hiddenAtom))) return next(e)
+    if (e.props.hasSurvey || e.props.isWorking) return next(e)
+    if ((await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)) return next(e)
 
     const ghost = await read($, ghostAtom)
-    const view = await read($, viewAtom)
-    const answer = await read($, answerAtom)
-    const why = await read($, whyAtom)
     const alt = current(ghost)
-    const width = Math.max(20, e.props.bodyColumns)
-
-    // Nothing to say, or Claude is still working on this turn: stay out of the way.
-    if (e.props.isWorking || (!alt && !(view === 'answer' && answer))) return next(e)
-
-    const { Box, Text, Button, Input } = $.ui.resolve(e)
-
-    const header = (
-      <Box key="head" flexDirection="row" gap={1}>
-        <Text color="magenta" bold>◐ shadow</Text>
-        {alt ? (
-          <Text dimColor>
-            {Math.round(alt.confidence * 100)}% · {alt.bucket}
-            {ghost && ghost.options.length > 1 ? ` · ${(ghost.index % ghost.options.length) + 1}/${ghost.options.length}` : ''}
-          </Text>
-        ) : null}
-      </Box>
-    )
-
-    const askBox = (
-      <Input
-        key="ask"
-        placeholder="ask shadow… (or type @shadow <question> in the chat bar)"
-        submitLabel="ask"
-        onSubmit={value => ask($, value)}
-      />
-    )
-
-    if (view === 'answer' && answer) {
-      return (
-        <Box flexDirection="column">
-          {header}
-          <Text key="q" dimColor wrap="truncate-end">you › {clip(answer.question, width - 6)}</Text>
-          <Text key="a" wrap="wrap">{answer.isPending ? 'thinking…' : answer.text}</Text>
-          <Box key="actions" flexDirection="row" gap={1}>
-            {!answer.isPending ? (
-              <Button key="send-answer" hotkey="s" label="send to Claude" onPress={() => useGhost($, answer.text)} />
-            ) : null}
-            {alt ? <Button key="back" hotkey="b" label="back" onPress={() => update($, viewAtom, () => 'ghost' as ShadowView)} /> : null}
-            <Button key="close" hotkey="c" label="close" role="dismiss"
-              onPress={async () => { await update($, answerAtom, () => null); await update($, viewAtom, () => 'ghost' as ShadowView) }} />
-          </Box>
-          {askBox}
-        </Box>
-      )
-    }
-
     if (!alt || !ghost) return next(e)
 
-    if (view === 'why') {
-      return (
-        <Box flexDirection="column">
-          {header}
-          <Text key="ghost" wrap="truncate-end">{clip(alt.text, width)}</Text>
-          <Text key="why-head" dimColor>why: what this situation brought back</Text>
-          {why === null ? (
-            <Text key="why-wait" dimColor>  looking…</Text>
-          ) : why.length === 0 ? (
-            <Text key="why-none" dimColor>  only a word match with a past reply</Text>
-          ) : (
-            why.map((w, i) => (
-              <Text key={`why-${i}`} wrap="truncate-end">
-                {'  '}• {clip(w.title, width - 30)} <Text dimColor>({w.type}{w.reason ? `, ${w.reason}` : ''})</Text>
-              </Text>
-            ))
-          )}
-          <Box key="actions" flexDirection="row" gap={1}>
-            <Button key="use" hotkey="u" variant="primary" label="use" onPress={() => useGhost($, alt.text)} />
-            <Button key="back" hotkey="b" label="back" onPress={() => update($, viewAtom, () => 'ghost' as ShadowView)} />
-          </Box>
-        </Box>
-      )
-    }
-
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const meta = alt.bucket === DRAFTED ? 'drafted' : `${Math.round(alt.confidence * 100)}% past reply`
+    const room = Math.max(10, e.props.bodyColumns - meta.length - 14)
     return (
       <Box flexDirection="column">
-        {header}
-        <Text key="ghost" wrap="wrap">{alt.text}</Text>
-        <Box key="actions" flexDirection="row" gap={1}>
+        <Box key="line" flexDirection="row" columnGap={1}>
+          <Text key="mark" backgroundColor={THEME.signal} color={THEME.ink} bold> ⠇ SHADOW </Text>
+          <Text key="meta" color={THEME.muted}>{meta}</Text>
+          <Text key="ghost" color={THEME.signal} bold wrap="truncate-end">{clip(alt.text, room)}</Text>
+        </Box>
+        <Box key="actions" flexDirection="row" columnGap={1}>
           <Button key="use" hotkey="u" variant="primary" label="use" onPress={() => useGhost($, alt.text)} />
           {ghost.options.length > 1 ? (
             <Button key="next" hotkey="n" label="next"
               onPress={() => update($, ghostAtom, g => (g ? { ...g, index: g.index + 1 } : g))} />
           ) : null}
-          <Button key="why" hotkey="w" label="why" onPress={() => explain($)} />
           <Button key="wrong" hotkey="x" label="wrong" onPress={() => markWrong($)} />
-          <Button key="hide" hotkey="h" label="hide" role="dismiss" onPress={() => update($, hiddenAtom, () => true)} />
+          <Button key="more" hotkey="m" label="more" onPress={() => openPane($)} />
         </Box>
-        {askBox}
+      </Box>
+    )
+  })
+
+  // ------------------------------------------------------------ the sidebar
+  // Drawn in the Shadow Link terminal theme (docs/brand.md): signal green on
+  // near black, a header bar, the GHOST box, and CORE MEMORY at the foot.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const width = Math.max(16, e.props.bodyColumns)
+    const isDocked = e.props.placement === 'dock'
+
+    const ghost = await read($, ghostAtom)
+    const alt = current(ghost)
+    const isWhyOpen = await read($, whyOpenAtom)
+    const why = await read($, whyAtom)
+    const answer = await read($, answerAtom)
+    const online = await read($, onlineAtom)
+    const waiting = await read($, waitingAtom)
+    const drafting = await read($, draftingAtom)
+    const stats = await read($, statsAtom)
+
+    const section = (key: string, label: string) => (
+      <Text key={key} color={THEME.signal} bold>{label}</Text>
+    )
+
+    const header = (
+      <Box key="header" flexDirection="column">
+        <Box key="bar" flexDirection="row" columnGap={1}>
+          <Text key="name" backgroundColor={THEME.signal} color={THEME.ink} bold> ⠇ SHADOW LINK </Text>
+          {online ? (
+            <Text key="link" backgroundColor={THEME.bar} color={THEME.ok} bold> link:{waiting ? 'WATCHING' : 'MIRRORING'} </Text>
+          ) : (
+            <Text key="link" backgroundColor={THEME.bar} color={THEME.warn} bold> link:OFFLINE </Text>
+          )}
+        </Box>
+        {isDocked ? <Text key="tagline" color={THEME.muted}>THE SHADOW OF YOU.</Text> : null}
+        {!online ? (
+          <Text key="offline" color={THEME.warn} wrap="wrap">run `shadow-link daemon` to link</Text>
+        ) : null}
+      </Box>
+    )
+
+    const ghostBox = (
+      <Box key="ghost-box" flexDirection="column" borderStyle="round" borderColor={THEME.border} paddingX={1}>
+        <Text key="ghost-title" color={THEME.signal} bold>GHOST</Text>
+        {alt && ghost ? (
+          <Box key="ghost-body" flexDirection="column">
+            <Text key="meta" color={alt.bucket === DRAFTED || alt.confidence >= 0.55 ? THEME.ok : THEME.warn}>
+              ⠇ {describe(alt)}
+              {ghost.options.length > 1 ? ` · ${(ghost.index % ghost.options.length) + 1}/${ghost.options.length}` : ''}
+            </Text>
+            <Text key="ghost" color={THEME.signal} bold wrap="wrap">{alt.text}</Text>
+          </Box>
+        ) : (
+          <Box key="ghost-body" flexDirection="column">
+            <Text key="ghost-none" color={THEME.warn}>{drafting ? '⠇ drafting…' : '⠇ (waiting · no ghost yet)'}</Text>
+            <Text key="ghost-hint" color={THEME.muted} wrap="wrap">
+              {drafting
+                ? `${cfg.ghostModel} is writing your likely reply`
+                : waiting
+                ? 'watching Claude…'
+                : stats.corpus !== null && stats.corpus < 20
+                  ? 'nothing yet: Shadow learns from each reply you send'
+                  : 'no strong guess for this one'}
+            </Text>
+          </Box>
+        )}
+      </Box>
+    )
+
+    const ghostKeys = alt && ghost ? (
+      <Box key="ghost-keys" flexDirection="row" flexWrap="wrap" columnGap={1}>
+        <Button key="use" hotkey="u" variant="primary" label="use" onPress={() => useGhost($, alt.text)} />
+        {ghost.options.length > 1 ? (
+          <Button key="next" hotkey="n" label="next"
+            onPress={() => update($, ghostAtom, g => (g ? { ...g, index: g.index + 1 } : g))} />
+        ) : null}
+        <Button key="why" hotkey="w" label="why" onPress={() => explain($)} />
+        <Button key="wrong" hotkey="x" label="wrong" onPress={() => markWrong($)} />
+      </Box>
+    ) : null
+
+    const whySection = alt && isWhyOpen ? (
+      <Box key="why-list" flexDirection="column">
+        {section('why-head', 'WHY')}
+        {why === null ? (
+          <Text key="why-wait" color={THEME.muted}>  looking…</Text>
+        ) : why.length === 0 ? (
+          <Text key="why-none" color={THEME.muted}>  only a word match with a past reply</Text>
+        ) : (
+          why.map((w, i) => (
+            <Text key={`why-${i}`} wrap="wrap" color={THEME.text}>
+              {'  '}• {clip(w.title, width * 2)} <Text color={THEME.muted}>({w.type}{w.reason ? `, ${w.reason}` : ''})</Text>
+            </Text>
+          ))
+        )}
+      </Box>
+    ) : null
+
+    const askSection = (
+      <Box key="ask-section" flexDirection="column">
+        {section('ask-head', 'ASK SHADOW')}
+        {answer ? (
+          <Box key="answer" flexDirection="column">
+            <Text key="q" color={THEME.muted} wrap="wrap">you › {answer.question}</Text>
+            <Text key="a" color={THEME.text} wrap="wrap">{answer.isPending ? 'thinking…' : answer.text}</Text>
+            {!answer.isPending ? (
+              <Box key="answer-actions" flexDirection="row" columnGap={1}>
+                <Button key="send-answer" hotkey="s" label="send to Claude" onPress={() => useGhost($, answer.text)} />
+                <Button key="clear-answer" hotkey="c" label="clear" onPress={() => update($, answerAtom, () => null)} />
+              </Box>
+            ) : null}
+          </Box>
+        ) : (
+          <Text key="ask-hint" color={THEME.muted} wrap="wrap">Claude never sees these.</Text>
+        )}
+        <Input key="ask" placeholder="ask about this session…" submitLabel="ask" onSubmit={value => ask($, value)} />
+      </Box>
+    )
+
+    const memory = (
+      <Box key="memory" flexDirection="column">
+        {isDocked ? section('memory-head', 'CORE MEMORY') : null}
+        <Text key="memory-corpus" color={THEME.text}>
+          {isDocked ? '  ' : ''}{stats.corpus !== null ? stats.corpus.toLocaleString() : '—'} <Text color={THEME.muted}>replies learned</Text>
+        </Text>
+        {stats.learned > 0 ? (
+          <Text key="memory-session" color={THEME.text}>
+            {isDocked ? '  ' : ''}{stats.learned} <Text color={THEME.muted}>this session</Text>
+          </Text>
+        ) : null}
+      </Box>
+    )
+
+    return (
+      <Box flexDirection="column" rowGap={isDocked ? 1 : 0}>
+        {header}
+        <Box key="ghost-group" flexDirection="column">
+          {ghostBox}
+          {ghostKeys}
+        </Box>
+        {whySection}
+        {askSection}
+        {memory}
       </Box>
     )
   })

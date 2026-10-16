@@ -12,18 +12,24 @@ export type ShadowWhy = { title: string; type: string; reason: string }
 
 export type ShadowAnswer = { question: string; text: string; isPending: boolean }
 
-export type ShadowView = 'ghost' | 'why' | 'answer'
+export type ShadowStats = { corpus: number | null; learned: number }
 
 declare module 'claude-code' {
   interface PluginState {
     'shadow-link': {
       ghost: ShadowGhost | null
       situation: string
-      view: ShadowView
+      /** Why the ghost on show was guessed; null while not asked (or loading, see isWhyOpen). */
       why: ShadowWhy[] | null
+      isWhyOpen: boolean
       answer: ShadowAnswer | null
       isOnline: boolean
-      isHidden: boolean
+      isWaiting: boolean
+      stats: ShadowStats
+      /** The person's latest messages this session, oldest first: their voice right now. */
+      recent: string[]
+      /** True while a model drafts the ghost for the turn that just ended. */
+      isDrafting: boolean
     }
   }
 }

@@ -45,7 +45,12 @@ pip install --only-binary :all: mitmproxy
 
 ## Shadow in Claude Code (recommended)
 
-Shadow floats right above the Claude Code chat bar. After each Claude turn it shows the reply you would likely send, also as dim text in the chat bar (Tab to take it). It explains its guess, and it answers side questions about the session without adding anything to Claude's conversation.
+Shadow lives in a sidebar beside the conversation. After each Claude turn it shows the reply you would likely send, also as dim text in the chat bar (Tab to take it). It explains its guess, and it answers side questions about the session without adding anything to Claude's conversation.
+
+- **Fullscreen layout** (`/tui fullscreen`, 110+ columns): the Shadow sidebar docks on the right and opens by itself.
+- **Default layout**: a two-row strip above the chat bar shows the guess; `more` (or `/shadow`) opens the full panel above the prompt.
+
+After each turn a Claude model (Haiku by default, `Ghost model` in `/config`; `off` for past replies only) drafts the reply in your voice from your closest past replies and your latest messages.
 
 Install it from inside Claude Code (version 2.1.275 or later):
 
@@ -62,9 +67,9 @@ shadow-link daemon
 | In Claude Code | What it does |
 |---|---|
 | Tab | Take the ghost shown in the chat bar. |
-| `use` / `next` / `why` / `wrong` / `hide` | Buttons on the floating band (click, or focus the band with ctrl+x Tab and press `u` `n` `w` `x` `h`). |
-| `@shadow <question>` | Ask Shadow about the session. Claude never sees it; the answer floats above the chat bar with **send to Claude**. |
-| `/shadow` | Hide or show Shadow. `/shadow status` checks the daemon link. |
+| `use` / `next` / `why` / `wrong` | Buttons in the sidebar (click, or focus it with ctrl+x Tab and press `u` `n` `w` `x`). The default-layout strip has `use` / `next` / `wrong` / `more`. |
+| **Ask Shadow** box | Ask about the session. Claude never sees it; the answer shows in the sidebar with **send to Claude**. |
+| `/shadow` | Open the sidebar. `/shadow <question>` asks from the chat bar; `/shadow status` checks the daemon link. |
 
 Shadow learns from what you actually send: a sent ghost is reinforced, `wrong` down-weights it, and every reply you type is saved as a reaction pair. Side questions run through your own Claude Code session (`$.model.fork` over the session transcript, served from the prompt cache), so no extra API key is needed. Settings (daemon URL, minimum confidence, chat-bar ghost on or off) are in `/config`.
 
@@ -92,6 +97,13 @@ To bootstrap the memory corpus from a Claude.ai export:
 shadow-link ingest-claude-export path\to\conversations.json
 ```
 
+Or from your local coding-agent histories (Claude Code, Codex CLI, Antigravity CLI). It is safe to re-run; it only adds new chats:
+
+```powershell
+shadow-link ingest-sessions
+shadow-link ingest-sessions --only codex agy
+```
+
 ## CLI commands
 
 | Command | What it does |
@@ -103,6 +115,7 @@ shadow-link ingest-claude-export path\to\conversations.json
 | `shadow-link query <text>` | Search stored replies. |
 | `shadow-link interactive` | Run the fast-reply simulator. |
 | `shadow-link ingest-claude-export <file>` | Import reaction pairs from a Claude.ai export. |
+| `shadow-link ingest-sessions [--only claude codex agy]` | Import reaction pairs from Claude Code, Codex CLI and Antigravity CLI histories. |
 | `shadow-link ingest-jsonl <file>` | Import an OGI/oneiros trace log. |
 | `shadow-link ingest-human <dir>` | Import paired question/response files. |
 | `shadow-link ingest-md <file>` | Import a Markdown prompt log. |

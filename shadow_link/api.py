@@ -25,18 +25,27 @@ from shadow_link.decay import effective_weight_for_row, BUCKET_DECAY_CLASS, _HAL
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("shadow_link.api")
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
+
 class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(format % args)
 
     def _set_headers(self, status=200, content_type="application/json"):
+        # No CORS headers: only local, non-browser clients (plugin, CLI, proxy,
+        # TUI) talk to the daemon, so web pages must not read its responses.
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        # Allow cross-origin requests for local API access
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
+
+    def _reject_untrusted(self) -> bool:
+        """403 for browser-originated or DNS-rebinding requests. Returns True if rejected."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        hostname = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+        if hostname not in _LOCAL_HOSTS or self.headers.get("Origin"):
+            self.send_error(403, "Forbidden")
+            return True
+        return False
 
     def send_error(self, code, message=None, explain=None):
         try:
@@ -49,9 +58,11 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             pass
 
     def do_OPTIONS(self):
-        self._set_headers(200)
+        self.send_error(405, "Method not allowed")
 
     def do_GET(self):
+        if self._reject_untrusted():
+            return
         parsed_path = urlparse(self.path)
         path_str = parsed_path.path
         if path_str == "/stats":
@@ -124,8 +135,13 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not found")
 
     def do_POST(self):
+        if self._reject_untrusted():
+            return
         parsed_path = urlparse(self.path)
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length and "application/json" not in self.headers.get("Content-Type", ""):
+            self.send_error(415, "Content-Type must be application/json")
+            return
         
         if content_length == 0:
             if parsed_path.path == "/watcher/clear":
@@ -252,9 +268,31 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     }
                 }
 
+            # Past (situation -> reply) pairs nearest this situation, for a model
+            # that drafts the reply in the user's own voice.
+            examples = []
+            try:
+                n_examples = max(0, min(int(data.get("examples") or 0), 20))
+            except (TypeError, ValueError):
+                n_examples = 0
+            if n_examples:
+                db = Database(config.db_path)
+                for r in Engine(db).predict_replies(question, top_k=n_examples):
+                    p = db.get_prompt(r.prompt_id) or {}
+                    try:
+                        m = json.loads(p.get("metadata") or "{}")
+                    except Exception:
+                        m = {}
+                    examples.append({
+                        "id": r.prompt_id,
+                        "situation": (m.get("agent_output") or m.get("question") or "")[:600],
+                        "reply": r.text[:500],
+                    })
+
             response_data = {
                 "ghost": ghost,
                 "alternates": alternates,
+                "examples": examples,
                 "ghost_suggestion": ghost["text"] if ghost else None,
                 "confidence": ghost["confidence"] if ghost else 0.0,
                 "source": ghost["source"] if ghost else None,
@@ -343,7 +381,12 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Parameter 'path' must be a non-empty string")
             return
         from pathlib import Path as _Path
-        if not _Path(path).exists():
+        projects = (_Path.home() / ".claude" / "projects").resolve()
+        resolved = _Path(path).resolve()
+        if resolved.suffix != ".jsonl" or projects not in resolved.parents:
+            self.send_error(400, "Transcript must be a .jsonl under ~/.claude/projects")
+            return
+        if not resolved.exists():
             self.send_error(400, f"Transcript not found: {path}")
             return
         try:

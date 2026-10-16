@@ -61,8 +61,13 @@ def main() -> None:
     prompt = (data.get("prompt") or "").strip()
     transcript_path = data.get("transcript_path", "")
 
-    # Skip trivia and slash commands
-    if len(prompt) < 4 or prompt.startswith("/"):
+    # Skip trivia, slash commands and tool wrappers; drop image placeholders
+    try:
+        from shadow_link.live import clean_reply, is_real_reply
+        if not is_real_reply(prompt):
+            _fail_safe()
+        prompt = clean_reply(prompt)
+    except Exception:
         _fail_safe()
 
     try:

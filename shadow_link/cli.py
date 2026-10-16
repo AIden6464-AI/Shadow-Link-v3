@@ -74,6 +74,20 @@ def handle_ingest_claude_export(args):
         print(f"Error during import: {e}", file=sys.stderr)
         sys.exit(1)
 
+def handle_ingest_sessions(args):
+    _, _, _, ingester = get_services()
+    sources = tuple(args.only) if args.only else ("claude", "codex", "agy")
+    print(f"Importing reaction pairs from agent CLI histories: {', '.join(sources)}")
+    try:
+        report = ingester.ingest_agent_sessions(sources)
+    except Exception as e:
+        print(f"Error during import: {e}", file=sys.stderr)
+        sys.exit(1)
+    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI"}
+    for src, r in report.items():
+        print(f"  {labels[src]:<16} {r['sessions']:>4} sessions  {r['imported']:>5} new pairs  "
+              f"({r['skipped']} already stored)")
+
 def handle_query(args):
     _, _, matcher, _ = get_services()
     print(f"Querying database for: '{args.text}'")
@@ -304,6 +318,11 @@ def main():
     ce_parser = subparsers.add_parser("ingest-claude-export", help="Import reaction pairs from a Claude.ai data export")
     ce_parser.add_argument("path", type=Path, help="Path to conversations.json")
     ce_parser.set_defaults(func=handle_ingest_claude_export)
+
+    # Agent CLI histories (Claude Code, Codex CLI, Antigravity CLI)
+    sessions_parser = subparsers.add_parser("ingest-sessions", help="Import reaction pairs from Claude Code, Codex CLI and Antigravity CLI histories")
+    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy"], help="Limit to these sources")
+    sessions_parser.set_defaults(func=handle_ingest_sessions)
 
     # Query Matcher
     query_parser = subparsers.add_parser("query", help="Query the hybrid matcher for predictions")
