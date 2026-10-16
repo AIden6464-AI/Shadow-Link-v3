@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -212,7 +212,7 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     pass
             
             created_time = p.get("created_at", time.time()) if p else time.time()
-            timestamp_str = datetime.utcfromtimestamp(created_time).isoformat() + "Z"
+            timestamp_str = datetime.fromtimestamp(created_time, timezone.utc).replace(tzinfo=None).isoformat() + "Z"
             
             serialized_matches.append({
                 "prompt": {
@@ -235,7 +235,11 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Parameter 'text' must be a non-empty string")
             return
             
-        top_k = data.get("top_k", 5)
+        try:
+            top_k = max(1, min(int(data.get("top_k", 5)), 100))
+        except (ValueError, TypeError):
+            self.send_error(400, "Parameter 'top_k' must be an integer")
+            return
         threshold = data.get("threshold")
         if threshold is not None:
             try:
@@ -266,8 +270,17 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
             
         try:
             config = Config()
-            from shadow_link.live import build_prediction
-            ghost, alternates = build_prediction(str(config.db_path), question, top_k=5)
+            import shadow_link.live as live_mod
+            # One prediction per Claude reply: the transcript watcher and the plugin
+            # both ask, and each may run the local model, so whoever is second reuses it.
+            watcher = live_mod.ACTIVE_WATCHER
+            cached = watcher.cached_prediction(question) if watcher is not None else None
+            if cached is not None:
+                ghost, alternates = cached
+            else:
+                ghost, alternates = live_mod.build_prediction(str(config.db_path), question, top_k=5)
+                if watcher is not None:
+                    watcher.remember_prediction(question, ghost, alternates)
 
             best_match = None
             if ghost:
@@ -510,8 +523,12 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
         try:
             from shadow_link.ingester import classify_multi
             qs = parse_qs(parsed_path.query)
-            limit = int(qs.get("limit", ["200"])[0])
-            offset = int(qs.get("offset", ["0"])[0])
+            try:
+                limit = max(1, min(int(qs.get("limit", ["200"])[0]), 1000))
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+            except ValueError:
+                self.send_error(400, "'limit' and 'offset' must be integers")
+                return
             search = (qs.get("q", [""])[0]).strip().lower()
             bucket_filter = qs.get("bucket", [None])[0]
             FLAG_BUCKETS = {"rejection", "correction", "pivot"}
@@ -543,7 +560,7 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     "flagged": flagged,
                     "source": meta.get("source", "unknown"),
                     "created_at": created,
-                    "timestamp": (datetime.utcfromtimestamp(created).isoformat() + "Z") if created else None,
+                    "timestamp": (datetime.fromtimestamp(created, timezone.utc).replace(tzinfo=None).isoformat() + "Z") if created else None,
                 }
                 if bucket_filter and bucket_filter not in tags and r["bucket"] != bucket_filter:
                     continue

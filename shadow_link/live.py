@@ -403,6 +403,22 @@ class LiveWatcher:
         except Exception as e:
             log.warning("warm: aborted: %s", e)
 
+    def cached_prediction(self, claude_output: str):
+        """(ghost, alternates) already predicted for this exact reply, or None."""
+        text = " ".join((claude_output or "").split())
+        with self._lock:
+            if text and " ".join((self._state.get("claude_output") or "").split()) == text:
+                return self._state.get("ghost"), list(self._state.get("alternates") or [])
+        return None
+
+    def remember_prediction(self, claude_output: str, ghost, alternates) -> None:
+        """A prediction made elsewhere (the plugin's /predict) for the reply this watcher will see."""
+        with self._lock:
+            self._state["claude_output"] = claude_output
+            self._state["ghost"] = ghost
+            self._state["alternates"] = alternates
+            self._state["updated_at"] = time.time()
+
     def get_state(self) -> dict:
         with self._lock:
             s = dict(self._state)
@@ -453,7 +469,8 @@ class LiveWatcher:
         if role == "assistant":
             with self._lock:
                 self._last_claude = text
-            ghost, alts = self._predict(text)
+            cached = self.cached_prediction(text)       # the plugin's /predict may have been first
+            ghost, alts = cached if cached is not None else self._predict(text)
             with self._lock:
                 self._state["claude_output"] = text
                 self._state["ghost"] = ghost

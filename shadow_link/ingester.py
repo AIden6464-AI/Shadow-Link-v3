@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -134,7 +134,7 @@ class Ingester:
                 continue
 
             metadata = {"source": "markdown_import", "file": filepath.name}
-            timestamp = datetime.utcnow().isoformat() + "Z"
+            timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
             
             self._process_and_store(
                 content=block,
@@ -161,7 +161,7 @@ class Ingester:
 
                 try:
                     data = json.loads(line)
-                    ts = data.get("ts", datetime.utcnow().isoformat() + "Z")
+                    ts = data.get("ts", datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z")
                     req = data.get("request", {})
                     messages = req.get("messages", [])
 
@@ -214,7 +214,7 @@ class Ingester:
                     r_text = r_file.read_text(encoding="utf-8").strip()
 
                     mtime = r_file.stat().st_mtime
-                    ts = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
+                    ts = datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None).isoformat() + "Z"
 
                     metadata = {
                         "source": "oneiros_human_history",
@@ -385,7 +385,7 @@ class Ingester:
         if not is_real_reply(response):
             return None
         response = clean_reply(response)
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
         metadata = {
             "source": "oneiros_live_ingest",
             "request_id": request_id,

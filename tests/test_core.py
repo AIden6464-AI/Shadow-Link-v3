@@ -476,6 +476,50 @@ def test_session_endpoints(home: Path, tmp_path: Path, monkeypatch):
         server.shutdown()
 
 
+def test_one_prediction_per_reply_and_input_validation(tmp_path: Path, monkeypatch):
+    import shadow_link.live as live_mod
+    from shadow_link.api import ShadowLinkAPIHandler
+    from urllib.error import HTTPError
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "p.db"))
+    calls = []
+    monkeypatch.setattr(live_mod, "build_prediction",
+                        lambda db, text, top_k=4, timeout_seconds=None: (calls.append(text), ({"text": "ok", "confidence": 0.5, "source": "retrieved", "tier": "medium"}, []))[1])
+    watcher = live_mod.LiveWatcher(str(tmp_path / "p.db"), str(tmp_path / "none.jsonl"))
+    monkeypatch.setattr(live_mod, "ACTIVE_WATCHER", watcher)
+    server = ThreadingHTTPServer(("localhost", 0), ShadowLinkAPIHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://localhost:{server.server_address[1]}"
+
+    def post(path, body):
+        req = Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        return json.loads(urlopen(req, timeout=10).read())
+
+    def status(path, body=None):
+        try:
+            if body is None:
+                urlopen(base + path, timeout=10)
+            else:
+                post(path, body)
+            return 200
+        except HTTPError as e:
+            return e.code
+
+    try:
+        # The plugin asks first; the watcher then sees the same reply and reuses the answer.
+        assert post("/predict", {"question": "Done. Want me to push?"})["ghost"]["text"] == "ok"
+        watcher._handle("assistant", "Done.  Want me to push?")
+        assert calls == ["Done. Want me to push?"]
+        # The watcher first; the plugin's /predict reuses it.
+        watcher._handle("assistant", "Tests pass now.")
+        post("/predict", {"question": "Tests pass now."})
+        assert calls == ["Done. Want me to push?", "Tests pass now."]
+        assert status("/query", {"text": "x", "top_k": "lots"}) == 400
+        assert status("/pairs?limit=abc") == 400
+        assert status("/pairs?limit=5") == 200
+    finally:
+        server.shutdown()
+
+
 # ------------------------------------------------------------------ phase 5
 @pytest.mark.parametrize("cmd", ["ui", "proxy", "run", "watch", "ingest-md"])
 def test_deprecated_commands_warn(cmd):
