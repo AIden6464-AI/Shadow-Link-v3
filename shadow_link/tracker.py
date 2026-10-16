@@ -123,9 +123,12 @@ class _FileParser:
         self.session_id: str = state.get("sid") or Path(path).stem
         self.cwd: str = state.get("cwd", "")
         self.pending: dict[str, dict] = {}
+        # A scripted run (`claude -p`, `codex exec`, Codex's approval reviewer) is
+        # recorded but is not an agent the person is working with.
+        self.automated: str = state.get("automated", "")
 
     def snapshot(self) -> dict:
-        return {"sid": self.session_id, "cwd": self.cwd}
+        return {"sid": self.session_id, "cwd": self.cwd, "automated": self.automated}
 
     def parse(self, rec: dict) -> list[dict]:
         raise NotImplementedError
@@ -145,6 +148,9 @@ class ClaudeCodeParser(_FileParser):
             self.cwd = rec["cwd"]
         if rec.get("sessionId"):
             self.session_id = rec["sessionId"]
+        entry = str(rec.get("entrypoint") or "")
+        if entry.startswith("sdk"):            # `claude -p` and the Agent SDK
+            self.automated = f"claude {entry}"
         typ = rec.get("type")
         msg = rec.get("message") or {}
         content = msg.get("content")
@@ -213,6 +219,11 @@ class CodexParser(_FileParser):
         if typ == "session_meta":
             self.session_id = p.get("id") or p.get("session_id") or self.session_id
             self.cwd = p.get("cwd") or self.cwd
+            source = p.get("source")
+            if source == "exec":
+                self.automated = "codex exec"
+            elif isinstance(source, dict) and "subagent" in source:
+                self.automated = "codex subagent"
             return []
         if typ == "turn_context":
             self.cwd = p.get("cwd") or self.cwd
@@ -515,7 +526,8 @@ def session_summary(rec: dict, now: float | None = None) -> dict:
         "id": rec["id"], "agent": rec["agent"], "label": AGENT_LABELS.get(rec["agent"], rec["agent"]),
         "project": rec["project"], "project_name": project_name(rec["project"]),
         "state": session_state(rec, now), "started": rec["started"], "last": rec["last"],
-        "goal": rec["goal"], "doing": doing, "files_changed": len(rec["files"]),
+        "goal": " ".join(rec["goal"].split()), "doing": " ".join(doing.split()),
+        "files_changed": len(rec["files"]), "automated": rec.get("automated", ""),
         "open_thread": rec["open_thread"], "errors": len(rec["errors"]),
         "digest": rec["digest"], "digest_by": rec["digest_by"],
         "needs_digest": session_state(rec, now) != "active" and rec["digest_by"] in ("", "template")
@@ -656,9 +668,11 @@ class SessionStore:
         return rec
 
     def list(self, project: str = "", agent: str = "", active_only: bool = False,
-             limit: int = 20, exclude: str = "") -> list[dict]:
+             limit: int = 20, exclude: str = "", include_automated: bool = False) -> list[dict]:
         now = time.time()
         recs = self.all()
+        if not include_automated:
+            recs = [r for r in recs if not r.get("automated")]
         if exclude:   # the asking client's own session (its raw id)
             recs = [r for r in recs if r.get("session_id") != exclude]
         if project:
@@ -820,6 +834,7 @@ class SessionTracker:
                         or new_record(agent, parser.session_id, key)
                     for ev in events:
                         apply_event(rec, ev, parser.cwd)
+                    rec["automated"] = parser.automated
                     changed[sid] = rec
                 cur["state"] = parser.snapshot()
             for sid, rec in list(changed.items()):

@@ -950,7 +950,8 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     return
                 items = sessions.list(project=params.get("project", ""), agent=params.get("agent", ""),
                                       active_only=params.get("active") in ("1", "true"), limit=limit,
-                                      exclude=params.get("exclude", ""))
+                                      exclude=params.get("exclude", ""),
+                                      include_automated=params.get("automated") in ("1", "true"))
                 self._send_json({"sessions": items,
                                  "tracking": TRACKER is not None,
                                  "problems": dict(TRACKER.errors) if TRACKER else {}})

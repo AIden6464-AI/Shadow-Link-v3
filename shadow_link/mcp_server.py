@@ -176,15 +176,18 @@ def _sessions():
 
 
 @mcp.tool()
-def shadow_sessions(project: str = "", agent: str = "", active_only: bool = False, limit: int = 10) -> str:
+def shadow_sessions(project: str = "", agent: str = "", active_only: bool = False, limit: int = 10,
+                    include_automated: bool = False) -> str:
     """
     What every coding agent is doing: recent Claude Code, Codex and Antigravity
     sessions with their project, state (active/idle/ended), what they are doing
     now, files changed, and any question they left open. Pass `project` (a folder
     path) to see only work in one repo. Use a session `id` with shadow_handoff.
+    Scripted runs (`claude -p`, `codex exec`) are left out unless include_automated.
     """
-    return json.dumps({"sessions": _sessions().list(project=project, agent=agent,
-                                                     active_only=active_only, limit=limit)}, indent=2)
+    return json.dumps({"sessions": _sessions().list(project=project, agent=agent, active_only=active_only,
+                                                     limit=limit, include_automated=include_automated)},
+                      indent=2)
 
 
 @mcp.tool()

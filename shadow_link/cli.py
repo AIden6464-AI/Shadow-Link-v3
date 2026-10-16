@@ -145,7 +145,8 @@ def handle_sessions(args):
     elif args.scan:
         SessionTracker(config.db_path).poll_once()
     items = SessionStore(CognitiveStore(config.db_path)).list(
-        project=args.project or "", agent=args.agent or "", active_only=args.active, limit=args.limit)
+        project=args.project or "", agent=args.agent or "", active_only=args.active, limit=args.limit,
+        include_automated=args.all)
     if not items:
         print("No agent sessions tracked yet. Run with --scan, or start `shadow-link daemon`.")
         return
@@ -467,6 +468,7 @@ def main():
     sess_parser.add_argument("--active", action="store_true", help="Only sessions active in the last 10 minutes")
     sess_parser.add_argument("--limit", type=int, default=15)
     sess_parser.add_argument("--scan", action="store_true", help="Read new session activity first (without the daemon)")
+    sess_parser.add_argument("--all", action="store_true", help="Include scripted runs (claude -p, codex exec)")
     sess_parser.add_argument("--rebuild", action="store_true",
                              help="Re-read all session files from the start (after an upgrade); keeps model summaries")
     sess_parser.set_defaults(func=handle_sessions)

@@ -236,6 +236,25 @@ def test_handoff_links_the_session_that_picks_it_up(home: Path, tmp_path: Path):
     assert not is_real_reply(packet["markdown"])                            # never learned as your reply
 
 
+def test_scripted_runs_are_recorded_but_not_listed(tmp_path: Path):
+    _jsonl(tmp_path / ".claude/projects/p/sdk-run.jsonl", [
+        {"type": "user", "sessionId": "sdk-run", "entrypoint": "sdk-cli", "cwd": str(tmp_path),
+         "timestamp": "2026-10-16T12:00:00Z", "message": {"role": "user", "content": "Agent: Codex.\nGoal: summarise"}}])
+    _jsonl(tmp_path / ".codex/sessions/2026/10/16/rollout-exec.jsonl", [
+        {"type": "session_meta", "timestamp": "2026-10-16T12:00:00Z", "payload": {"id": "exec-run", "cwd": str(tmp_path), "source": "exec"}},
+        {"type": "response_item", "timestamp": "2026-10-16T12:00:00Z", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "call shadow_sessions please"}]}}])
+    _jsonl(tmp_path / ".claude/projects/p/person.jsonl", [
+        {"type": "user", "sessionId": "person", "entrypoint": "cli", "cwd": str(tmp_path),
+         "timestamp": "2026-10-16T12:00:00Z", "message": {"role": "user", "content": "build the\nsettings page"}}])
+    tr = _tracker(tmp_path, tmp_path)
+    tr.poll_once()
+    listed = tr.sessions.list()
+    assert [s["goal"] for s in listed] == ["build the settings page"]          # one line, scripted runs hidden
+    every = {s["automated"] for s in tr.sessions.list(include_automated=True)}
+    assert every == {"", "claude sdk-cli", "codex exec"}
+
+
 def test_antigravity_ide_is_tracked_too(tmp_path: Path):
     _jsonl(tmp_path / ".gemini/antigravity/brain/ide-sess/.system_generated/logs/transcript.jsonl", [
         {"type": "USER_INPUT", "source": "USER_EXPLICIT", "created_at": "2026-10-16T12:00:00Z",

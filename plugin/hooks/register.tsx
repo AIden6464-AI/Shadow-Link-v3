@@ -662,8 +662,9 @@ export const register: Register = (on, options) => {
     const isEarlier = liveAgents.length === 0
     const shown = (isEarlier ? agents.slice(0, 3) : liveAgents).slice(0, isDocked ? 5 : 2)
     // A raw command says little about the work; the file being edited or the goal says more.
+    const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim()
     const summaryLine = (a: ShadowAgent) =>
-      a.doing.startsWith('editing ') ? a.doing : a.goal ? `goal: ${a.goal}` : a.doing
+      oneLine(a.doing.startsWith('editing ') ? a.doing : a.goal ? `goal: ${a.goal}` : a.doing)
     const problems = Object.entries(await read($, problemsAtom))
     const agentsSection = online ? (
       <Box key="agents" flexDirection="column">
