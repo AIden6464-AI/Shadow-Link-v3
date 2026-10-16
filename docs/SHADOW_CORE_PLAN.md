@@ -4,6 +4,8 @@ Status: phases 1 to 5 built. Phase 5 is the warning release: the old pieces stil
 
 Also built: decisions (a choice you state, or a yes/pick stored with the question it answered), handoff chains (the session that picks a brief up is linked to it), the Antigravity IDE as a fourth source, `tracking.ignore` / `tracking.enabled`, daily pruning, `shadow-link forget`, `sessions --rebuild`, database size in CORE MEMORY, read problems shown under AGENTS, named-session timelines for side questions, and a filter that keeps pasted terminal output and logs out of your replies.
 
+Since then: OpenCode (its SQLite store, read-only, only the session/message/part tables) and the Gemini CLI are tracked and importable; scripted runs (`claude -p`, `codex exec`, subagents) are recorded but hidden from lists; Haiku's summary also picks out decisions; the sidebar was checked in a real Claude Code window.
+
 Defaults taken for the open questions below: every project is tracked; digests name files without code diffs; Claude Code, Codex and Antigravity are covered, and any other agent can report through `shadow_report`.
 
 ## Goal
@@ -151,4 +153,4 @@ Each phase ends with tests passing and something you can see working.
 
 1. Should Shadow track all projects, or only ones you opt in (for example with a `.shadow` file in the repo)?
 2. Should digests include code diffs, or only file names and reasons?
-3. Do any other agents need to be covered now (Cursor, Aider, the Gemini CLI)?
+3. Do any other agents need to be covered now? OpenCode and the Gemini CLI are now covered; Cursor and Aider have no history on this machine.

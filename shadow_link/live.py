@@ -234,13 +234,20 @@ _SHELL_PROMPT_RE = re.compile(r"^(?:PS [A-Za-z]:\\[^>\n]*>|[\w.-]+@[\w.-]+:[^$\n
 _PROSE_LINE_RE = re.compile(r"^[A-Za-z\"'(]")
 
 
+# Lines that read like words but are code or a stack frame.
+_CODE_LINE_RE = re.compile(
+    r"^(?:File \"|from [\w.]+ import |import [\w.]+|def |class |async def |return |@\w|if __name__)"
+    r"|[{};]\s*$|^\s*[\w.]+\(.*\)\s*$|\w+\s*=\s*\S")
+
+
 def _is_prose(line: str) -> bool:
-    return bool(_PROSE_LINE_RE.match(line)) and len(line.split()) >= 3 and not _SHELL_PROMPT_RE.match(line)
+    return (bool(_PROSE_LINE_RE.match(line)) and len(line.split()) >= 3
+            and not _SHELL_PROMPT_RE.match(line) and not _CODE_LINE_RE.search(line))
 
 
 _DUMP_START_RE = re.compile(
     r"^(?:Traceback \(most recent call last\)|Exception in thread|npm (?:ERR!|error)|error\[E\d+\]|"
-    r"\w*(?:Error|Exception): |at [\w.$<>]+\(|Uncaught |FATAL|panic: )")
+    r"\w*(?:Error|Exception): |at [\w.$<>]+\(|Uncaught |FATAL|panic: |Windows PowerShell$|Starting Container)")
 
 
 def _looks_pasted(lines: list[str]) -> bool:

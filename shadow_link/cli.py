@@ -94,14 +94,15 @@ def handle_ingest_claude_export(args):
 
 def handle_ingest_sessions(args):
     _, _, _, ingester = get_services()
-    sources = tuple(args.only) if args.only else ("claude", "codex", "agy", "agy-ide")
+    sources = tuple(args.only) if args.only else ("claude", "codex", "agy", "agy-ide", "opencode", "gemini")
     print(f"Importing reaction pairs from agent CLI histories: {', '.join(sources)}")
     try:
         report = ingester.ingest_agent_sessions(sources)
     except Exception as e:
         print(f"Error during import: {e}", file=sys.stderr)
         sys.exit(1)
-    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI", "agy-ide": "Antigravity IDE"}
+    labels = {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity CLI", "agy-ide": "Antigravity IDE",
+              "opencode": "OpenCode", "gemini": "Gemini CLI"}
     for src, r in report.items():
         print(f"  {labels[src]:<16} {r['sessions']:>4} sessions  {r['imported']:>5} new pairs  "
               f"({r['skipped']} already stored)")
@@ -459,7 +460,7 @@ def main():
 
     # Agent CLI histories (Claude Code, Codex CLI, Antigravity CLI)
     sessions_parser = subparsers.add_parser("ingest-sessions", help="Import reaction pairs from Claude Code, Codex CLI and Antigravity CLI histories")
-    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy", "agy-ide"], help="Limit to these sources")
+    sessions_parser.add_argument("--only", nargs="+", choices=["claude", "codex", "agy", "agy-ide", "opencode", "gemini"], help="Limit to these sources")
     sessions_parser.set_defaults(func=handle_ingest_sessions)
 
     sess_parser = subparsers.add_parser("sessions", help="List what every coding agent is doing (Claude Code, Codex, Antigravity)")

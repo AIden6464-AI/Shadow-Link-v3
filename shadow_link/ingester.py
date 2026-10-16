@@ -328,7 +328,8 @@ class Ingester:
 
         home = Path(home) if home else Path.home()
         readers = {"claude": _claude_code_sessions, "codex": _codex_sessions, "agy": _antigravity_sessions,
-                   "agy-ide": _antigravity_ide_sessions}
+                   "agy-ide": _antigravity_ide_sessions, "opencode": _opencode_sessions,
+                   "gemini": _gemini_sessions}
 
         existing: set[tuple[str, str]] = set()
         for r in self.db.all_prompts():
@@ -478,6 +479,59 @@ def _codex_sessions(home: Path):
 
 
 _AGY_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
+
+
+def _opencode_sessions(home: Path):
+    """OpenCode's SQLite store: only the session, message and part tables are read."""
+    import sqlite3
+    db = home / ".local" / "share" / "opencode" / "opencode.db"
+    if not db.exists():
+        return
+    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        sessions = [r["id"] for r in conn.execute("SELECT id FROM session WHERE parent_id IS NULL ORDER BY time_created")]
+        for sid in sessions:
+            turns = []
+            rows = conn.execute(
+                "SELECT m.id AS mid, m.data AS mdata, p.data AS pdata, p.time_created AS t"
+                "  FROM message m JOIN part p ON p.message_id = m.id"
+                " WHERE m.session_id = ? ORDER BY m.time_created, p.time_created", (sid,)).fetchall()
+            texts: dict[str, list] = {}
+            for r in rows:
+                try:
+                    m, p = json.loads(r["mdata"]), json.loads(r["pdata"])
+                except ValueError:
+                    continue
+                if p.get("type") != "text" or p.get("synthetic") or p.get("ignored"):
+                    continue
+                entry = texts.setdefault(r["mid"], [m.get("role"), [], r["t"] / 1000.0])
+                entry[1].append(p.get("text") or "")
+            for role, parts, ts in texts.values():
+                text = "\n".join(t for t in parts if t.strip()).strip()
+                if role in ("user", "assistant") and text:
+                    turns.append((role, text, ts))
+            yield sid, turns
+    finally:
+        conn.close()
+
+
+def _gemini_sessions(home: Path):
+    """The Gemini CLI's chat files (~/.gemini/tmp/<project>/chats/session-*.json)."""
+    for path in sorted(home.glob(".gemini/tmp/*/chats/session-*.json")):
+        try:
+            chat = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        turns = []
+        for msg in chat.get("messages") or []:
+            content = msg.get("content")
+            text = (content if isinstance(content, str) else "\n".join(
+                c.get("text", "") for c in content or [] if isinstance(c, dict))).strip()
+            role = {"user": "user", "gemini": "assistant"}.get(msg.get("type"))
+            if role and text:
+                turns.append((role, text, _epoch(msg.get("timestamp"))))
+        yield chat.get("sessionId") or path.stem, turns
 
 
 def _antigravity_ide_sessions(home: Path):

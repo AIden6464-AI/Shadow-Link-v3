@@ -107,6 +107,9 @@ def test_pasted_output_is_not_your_voice():
     assert is_real_reply(kept) and clean_reply(kept) == "can you fix this crash"
     assert clean_reply("like the sidebar in opencode [Image #2]") == "like the sidebar in opencode"
     assert is_real_reply("ok build it with the venv")
+    assert not is_real_reply('Starting Container\n run(\n File "/app/x.py", line 3, in main\n    boom()\nValueError: no')
+    assert not is_real_reply("Windows PowerShell\nCopyright (C) Microsoft Corporation. All rights reserved.\n\nInstall the latest")
+    assert is_real_reply("set x = 5 in the config please") and is_real_reply("add a return button to the page")
 
 
 def test_add_prompt_unique_is_atomic(tmp_path: Path):
@@ -253,6 +256,92 @@ def test_scripted_runs_are_recorded_but_not_listed(tmp_path: Path):
     assert [s["goal"] for s in listed] == ["build the settings page"]          # one line, scripted runs hidden
     every = {s["automated"] for s in tr.sessions.list(include_automated=True)}
     assert every == {"", "claude sdk-cli", "codex exec"}
+
+
+def _opencode_db(home: Path, repo: Path) -> Path:
+    """A minimal OpenCode store: a session with a user turn, a reply, an edit and a failing bash call."""
+    db = home / ".local/share/opencode/opencode.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(db)
+    c.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, slug TEXT, directory TEXT,
+                              title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER,
+                           time_updated INTEGER, data TEXT);
+        CREATE TABLE credential (id TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO credential VALUES ('c1', 'sk-ant-should-never-be-read-000000');
+    """)
+    now = int(time.time() * 1000)
+    c.execute("INSERT INTO session VALUES ('ses_1','p',NULL,'s',?,'t','1',?,?)", (str(repo), now, now))
+    c.execute("INSERT INTO session VALUES ('ses_sub','p','ses_1','s',?,'t','1',?,?)", (str(repo), now, now))
+    msgs = [("m1", "ses_1", {"role": "user"}), ("m2", "ses_1", {"role": "assistant", "path": {"cwd": str(repo)}}),
+            ("m3", "ses_sub", {"role": "user"})]
+    for i, (mid, sid, data) in enumerate(msgs):
+        c.execute("INSERT INTO message VALUES (?,?,?,?,?)", (mid, sid, now + i, now + i, json.dumps(data)))
+    parts = [
+        ("p1", "m1", "ses_1", {"type": "text", "text": "add retries to the fetcher"}),
+        ("p2", "m2", "ses_1", {"type": "text", "text": "Added retries. Want me to add tests too?"}),
+        ("p3", "m2", "ses_1", {"type": "tool", "tool": "edit", "state": {"status": "completed",
+                                "input": {"filePath": str(repo / "fetcher.py")}}}),
+        ("p4", "m2", "ses_1", {"type": "tool", "tool": "bash", "state": {"status": "error",
+                                "input": {"command": "pytest -q"}}}),
+        ("p5", "m3", "ses_sub", {"type": "text", "text": "subagent task prompt here"}),
+    ]
+    for i, (pid, mid, sid, data) in enumerate(parts):
+        c.execute("INSERT INTO part VALUES (?,?,?,?,?,?)", (pid, mid, sid, now + 10 + i, now + 10 + i, json.dumps(data)))
+    c.commit()
+    c.close()
+    return db
+
+
+def test_opencode_is_tracked_from_its_database(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    _opencode_db(tmp_path, repo)
+    tr = _tracker(tmp_path, tmp_path)
+    tr.poll_once()
+    (s,) = tr.sessions.list(agent="opencode")
+    assert s["label"] == "OpenCode" and s["project_name"] == "repo" and s["goal"] == "add retries to the fetcher"
+    rec = tr.sessions.load(s["id"])
+    assert any(f.endswith("fetcher.py") for f in rec["files"])
+    assert rec["commands"][-1] == {**rec["commands"][-1], "cmd": "pytest -q", "status": "error"}
+    assert rec["open_thread"] == "Want me to add tests too?"
+    assert "sk-ant" not in json.dumps(tr.sessions.all())                    # credentials are never read
+    sub = [x for x in tr.sessions.list(agent="opencode", include_automated=True) if x["automated"]]
+    assert [x["automated"] for x in sub] == ["opencode subagent"]
+    assert tr.poll_once() == []                                              # nothing new, nothing re-read
+
+
+def test_gemini_cli_is_tracked_and_new_messages_only(tmp_path: Path):
+    chat = tmp_path / ".gemini/tmp/proj/chats/session-1.json"
+    chat.parent.mkdir(parents=True)
+    body = {"sessionId": "g1", "messages": [
+        {"type": "user", "timestamp": "2026-10-16T12:00:00Z", "content": [{"text": "build the cluster runner"}]},
+        {"type": "gemini", "timestamp": "2026-10-16T12:00:05Z", "content": "Done. Shall I wire it to the CLI?"}]}
+    chat.write_text(json.dumps(body), encoding="utf-8")
+    tr = _tracker(tmp_path, tmp_path)
+    tr.poll_once()
+    (s,) = tr.sessions.list(agent="gemini")
+    assert s["label"] == "Gemini CLI" and s["goal"] == "build the cluster runner"
+    body["messages"].append({"type": "user", "timestamp": "2026-10-16T12:01:00Z", "content": [{"text": "yes wire it"}]})
+    time.sleep(0.05)
+    chat.write_text(json.dumps(body), encoding="utf-8")
+    import os
+    os.utime(chat, (time.time() + 5, time.time() + 5))
+    tr.poll_once()
+    rec = tr.sessions.load(s["id"])
+    assert rec["requests"] == ["build the cluster runner", "yes wire it"]    # the first one not read twice
+
+
+def test_opencode_and_gemini_history_import(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _opencode_db(tmp_path, repo)
+    from shadow_link.ingester import _opencode_sessions
+    sessions = dict(_opencode_sessions(tmp_path))
+    assert list(sessions) == ["ses_1"]                                       # subagent runs are not you
+    assert [r for r, *_ in sessions["ses_1"]] == ["user", "assistant"]
 
 
 def test_antigravity_ide_is_tracked_too(tmp_path: Path):

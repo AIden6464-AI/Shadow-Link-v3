@@ -79,7 +79,7 @@ The plugin lives in [`plugin/`](plugin/).
 
 ## Shadow across your agents
 
-`shadow-link daemon` keeps track of what every coding agent is doing: Claude Code, Codex CLI, Antigravity CLI and the Antigravity IDE. It reads each agent's own session files as they grow, records per session what you asked, the decisions you made (spotted in what you type, and picked out by Haiku when it summarises a quiet session), files changed, commands and tests (pass or fail), errors and the question it left open, and keeps it in Shadow's memory (the ACA graph) with your past replies. Credentials are redacted before anything is stored, and pasted terminal output or logs are never mistaken for your own words. See [`docs/SHADOW_CORE_PLAN.md`](docs/SHADOW_CORE_PLAN.md).
+`shadow-link daemon` keeps track of what every coding agent is doing: Claude Code, Codex CLI, Antigravity CLI, the Antigravity IDE, OpenCode and the Gemini CLI. (From OpenCode's database it reads only the session, message and part tables, never its accounts or credentials.) Scripted runs such as `claude -p`, `codex exec` and subagents are recorded but left out of the lists unless you ask (`shadow-link sessions --all`). It reads each agent's own session files as they grow, records per session what you asked, the decisions you made (spotted in what you type, and picked out by Haiku when it summarises a quiet session), files changed, commands and tests (pass or fail), errors and the question it left open, and keeps it in Shadow's memory (the ACA graph) with your past replies. Credentials are redacted before anything is stored, and pasted terminal output or logs are never mistaken for your own words. See [`docs/SHADOW_CORE_PLAN.md`](docs/SHADOW_CORE_PLAN.md).
 
 Handing work over is always on request, and Shadow never sends anything to an agent itself:
 
@@ -128,7 +128,7 @@ shadow-link ingest-sessions --only codex agy
 | `shadow-link query <text>` | Search stored replies. |
 | `shadow-link interactive` | Run the fast-reply simulator. |
 | `shadow-link ingest-claude-export <file>` | Import reaction pairs from a Claude.ai export. |
-| `shadow-link ingest-sessions [--only claude codex agy agy-ide]` | Import reaction pairs from Claude Code, Codex CLI, Antigravity CLI and Antigravity IDE histories. |
+| `shadow-link ingest-sessions [--only claude codex agy agy-ide opencode gemini]` | Import reaction pairs from Claude Code, Codex CLI, Antigravity CLI, Antigravity IDE, OpenCode and Gemini CLI histories. |
 | `shadow-link mcp` | Run the stdio MCP server. |
 | `shadow-link aca <text> [--task id] [--kind error]` | Associative Context Activation: show what an event activates, why, and the decision signals. |
 | `shadow-link aca --replay --task <id>` | Replay everything ACA did for a task. |

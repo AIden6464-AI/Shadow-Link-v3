@@ -25,9 +25,9 @@ from pathlib import Path
 
 from shadow_link.aca.store import CognitiveStore
 
-AGENTS = ("claude-code", "codex", "antigravity", "antigravity-ide")
+AGENTS = ("claude-code", "codex", "antigravity", "antigravity-ide", "opencode", "gemini")
 AGENT_LABELS = {"claude-code": "Claude Code", "codex": "Codex", "antigravity": "Antigravity",
-                "antigravity-ide": "Antigravity IDE"}
+                "antigravity-ide": "Antigravity IDE", "opencode": "OpenCode", "gemini": "Gemini CLI"}
 
 ACTIVE_SECONDS = 10 * 60          # active: something happened in the last 10 minutes
 IDLE_DIGEST_SECONDS = 10 * 60     # a session quiet this long gets a digest
@@ -829,14 +829,10 @@ class SessionTracker:
                         continue
                     if not events:
                         continue
-                    sid = session_node_id(agent, parser.session_id)
-                    rec = changed.get(sid) or self._records.get(sid) or self.sessions.load(sid) \
-                        or new_record(agent, parser.session_id, key)
-                    for ev in events:
-                        apply_event(rec, ev, parser.cwd)
-                    rec["automated"] = parser.automated
-                    changed[sid] = rec
+                    self._fold(changed, agent, parser.session_id, key, parser.cwd, parser.automated, events)
                 cur["state"] = parser.snapshot()
+            self._poll_opencode(changed, now)
+            self._poll_gemini(changed, now)
             for sid, rec in list(changed.items()):
                 if is_ignored(rec["project"], self.ignored):
                     changed.pop(sid)
@@ -849,6 +845,158 @@ class SessionTracker:
             if now - self._last_prune > 86400:
                 self.prune(now)
         return list(changed)
+
+    def _fold(self, changed: dict, agent: str, raw_sid: str, transcript: str, cwd: str,
+              automated: str, events: list[dict]) -> None:
+        """Apply one source's events to its session record (loaded once per poll)."""
+        sid = session_node_id(agent, raw_sid)
+        rec = changed.get(sid) or self._records.get(sid) or self.sessions.load(sid) \
+            or new_record(agent, raw_sid, transcript)
+        for ev in events:
+            apply_event(rec, ev, cwd)
+        rec["automated"] = automated
+        changed[sid] = rec
+
+    # ------------------------------------------------------------- OpenCode
+    # OpenCode keeps sessions in one SQLite database. Only its session, message
+    # and part tables are read (read-only); its account and credential tables never.
+    _OPENCODE_WRITE_TOOLS = {"edit", "write", "multiedit", "patch", "apply_patch"}
+
+    def _poll_opencode(self, changed: dict, now: float) -> None:
+        import sqlite3
+        db = self.home / ".local" / "share" / "opencode" / "opencode.db"
+        if not db.exists():
+            return
+        key = f"opencode:{db}"
+        cur = self._cursors.get(key)
+        if cur is None:
+            cur = self._cursors[key] = {"t": int((now - self.backfill_seconds) * 1000)}
+        emitted = self._parsers.setdefault(key, {})       # part ids already turned into events
+        try:
+            conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=2)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT p.id, p.session_id, p.time_updated, p.data, m.data AS mdata,"
+                    "       s.directory, s.parent_id"
+                    "  FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = p.session_id"
+                    " WHERE p.time_updated > ? ORDER BY p.time_updated LIMIT 5000", (cur["t"],)).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            self.errors["opencode"] = str(e)
+            return
+        self.errors.pop("opencode", None)
+        from shadow_link.live import clean_reply, is_real_reply
+        by_session: dict[str, tuple[str, str, list[dict]]] = {}
+        for r in rows:
+            cur["t"] = max(cur["t"], int(r["time_updated"]))
+            try:
+                d, m = json.loads(r["data"]), json.loads(r["mdata"])
+            except ValueError:
+                continue
+            role, typ, ts = m.get("role"), d.get("type"), r["time_updated"] / 1000.0
+            cwd = ((m.get("path") or {}).get("cwd")) or r["directory"] or ""
+            ev = None
+            if typ == "text" and not d.get("synthetic") and not d.get("ignored"):
+                text = (d.get("text") or "").strip()
+                if role == "user" and r["id"] not in emitted:
+                    if handoff_ref(text):
+                        ev = {"kind": "handoff_in", "handoff": handoff_ref(text), "ts": ts}
+                    elif is_real_reply(text):
+                        ev = {"kind": "user", "text": clean_reply(text), "ts": ts}
+                elif role == "assistant" and text:
+                    ev = {"kind": "assistant", "text": text, "ts": ts}   # the latest streamed version
+            elif typ == "tool" and r["id"] not in emitted:
+                state = d.get("state") or {}
+                status = {"completed": "ok", "error": "error"}.get(state.get("status"))
+                if status:
+                    inp = state.get("input") or {}
+                    tool = str(d.get("tool") or "")
+                    path = inp.get("filePath") or inp.get("path") or ""
+                    ev = {"kind": "tool", "tool": tool, "ts": ts, "status": status,
+                          "command": inp.get("command", "") if tool == "bash" else "",
+                          "written": [path] if path and tool in self._OPENCODE_WRITE_TOOLS else [],
+                          "read": [path] if path and tool == "read" else []}
+                    if not (ev["command"] or ev["written"]):
+                        ev = None if status == "ok" else ev
+            elif typ == "patch" and r["id"] not in emitted:
+                files = [f for f in d.get("files") or [] if isinstance(f, str)]
+                if files:
+                    ev = {"kind": "tool", "tool": "patch", "ts": ts, "status": "ok", "command": "",
+                          "written": files, "read": []}
+            if ev is None:
+                continue
+            if ev["kind"] != "assistant":
+                emitted[r["id"]] = True
+            automated = "opencode subagent" if r["parent_id"] else ""
+            _, _, events = by_session.setdefault(r["session_id"], (cwd, automated, []))
+            events.append(ev)
+            by_session[r["session_id"]] = (cwd or by_session[r["session_id"]][0], automated, events)
+        if len(emitted) > 20000:                           # the cursor already covers old parts
+            for k in list(emitted)[:10000]:
+                emitted.pop(k)
+        for raw_sid, (cwd, automated, events) in by_session.items():
+            self._fold(changed, "opencode", raw_sid, str(db), cwd, automated, events)
+
+    # ----------------------------------------------------------- Gemini CLI
+    # The Gemini CLI rewrites one JSON file per chat; only messages after the
+    # last count seen are new.
+    def _poll_gemini(self, changed: dict, now: float) -> None:
+        from shadow_link.live import clean_reply, is_real_reply
+        try:
+            files = list(self.home.glob(".gemini/tmp/*/chats/session-*.json"))
+        except OSError as e:
+            self.errors["gemini"] = str(e)
+            return
+        for path in files:
+            key = str(path)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            cur = self._cursors.get(key)
+            if cur is None:
+                if now - mtime > self.backfill_seconds:
+                    self._cursors[key] = {"count": None, "mtime": mtime}   # history: skip until it grows
+                    continue
+                cur = self._cursors[key] = {"count": 0, "mtime": 0}
+            if mtime == cur["mtime"]:
+                continue
+            try:
+                chat = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                self.errors["gemini"] = f"{path.name}: {e}"
+                continue
+            messages = chat.get("messages") or []
+            start = len(messages) if cur["count"] is None else cur["count"]
+            cur.update(count=len(messages), mtime=mtime)
+            events = []
+            for msg in messages[start:]:
+                ts = _epoch(msg.get("timestamp"))
+                content = msg.get("content")
+                text = (content if isinstance(content, str) else "\n".join(
+                    c.get("text", "") for c in content or [] if isinstance(c, dict))).strip()
+                if msg.get("type") == "user" and text:
+                    if handoff_ref(text):
+                        events.append({"kind": "handoff_in", "handoff": handoff_ref(text), "ts": ts})
+                    elif is_real_reply(text):
+                        events.append({"kind": "user", "text": clean_reply(text), "ts": ts})
+                elif msg.get("type") == "gemini":
+                    if text:
+                        events.append({"kind": "assistant", "text": text, "ts": ts})
+                    for call in msg.get("toolCalls") or []:
+                        args = call.get("args") or {}
+                        name = str(call.get("name") or "")
+                        path_arg = args.get("file_path") or args.get("absolute_path") or ""
+                        events.append({
+                            "kind": "tool", "tool": name, "ts": ts,
+                            "status": "error" if call.get("status") == "error" else "ok",
+                            "command": args.get("command", "") if "shell" in name else "",
+                            "written": [path_arg] if path_arg and ("write" in name or "replace" in name or "edit" in name) else [],
+                            "read": []})
+            if events:
+                self._fold(changed, "gemini", chat.get("sessionId") or path.stem, key, "", "", events)
 
     def prune(self, now: float | None = None) -> dict:
         """Drop raw activity older than keep_days; sessions, digests, decisions stay."""
