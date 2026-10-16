@@ -347,7 +347,7 @@ test('AGENTS lists what the other agents are doing, and open shows the detail', 
   await claudeReplies($)
   const ui = await sidebar($, 'terminal')
   expect(await ui.find({ type: 'Text', text: /Antigravity/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /ran git status/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /goal: fix the fetch retries/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /editing chat\.html/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /goal: make the admin page/ })).toBeUndefined()
   await ui.press({ key: 'open-1' })
@@ -377,6 +377,17 @@ test('/shadow handoff codex picks that agent\'s latest session', async ($, on) =
   expect(JSON.stringify(out)).toContain('Handoff from Codex (veyr) is in the chat bar')
   const none = await $.command.run({ command: 'shadow', args: 'handoff cursor', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
   expect(JSON.stringify(none)).toContain('no recent session matching')
+})
+
+test('the summary model also reports the decisions made, sent with the summary', async ($, on) => {
+  const calls = fakes(on, {
+    sessions: [CODEX],
+    draft: 'SUMMARY: Codex added model costs to the admin page. Tests pass.\nDECISIONS:\n- Show costs per model, not per provider\n- Keep the dropdown',
+  })
+  await claudeReplies($)
+  const digest = calls.fetches.find(f => f.url.endsWith(`/sessions/${CODEX.id}/digest`))
+  expect(digest?.body.text).toBe('Codex added model costs to the admin page. Tests pass.')
+  expect(digest?.body.decisions).toEqual(['Show costs per model, not per provider', 'Keep the dropdown'])
 })
 
 test('a quiet session gets a model-written summary, once', async ($, on) => {

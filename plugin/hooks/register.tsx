@@ -313,9 +313,23 @@ async function refreshAgents($: EngineInterface) {
 
 const DIGEST_SYSTEM = [
   'You summarise one coding-agent session for the developer who ran it.',
-  'Write 2 or 3 short plain sentences: what was being worked on, where it stands now, and what is left or blocked.',
-  'No preamble, no headings, no lists.',
-].join(' ')
+  'Answer in exactly this shape:',
+  'SUMMARY: 2 or 3 short plain sentences on what was being worked on, where it stands now, and what is left or blocked.',
+  'DECISIONS: one line per decision the developer made (a choice, a rule, a direction), each starting "- ", written so it',
+  'makes sense on its own (e.g. "- Use Haiku to draft replies, not a local model"). Write "DECISIONS: none" if there were none.',
+  'Only list what the developer decided, never what the agent proposed and was not confirmed.',
+].join('\n')
+
+/** Split the model's digest into the summary and the decisions it found. */
+function parseDigest(raw: string): { summary: string; decisions: string[] } {
+  const text = raw.trim().replace(/^["'“]+|["'”]+$/g, '').trim()
+  const [head, tail = ''] = text.split(/^\s*DECISIONS:/im)
+  const summary = head.replace(/^\s*SUMMARY:\s*/i, '').trim()
+  const decisions = /^\s*none\b/i.test(tail)
+    ? []
+    : tail.split('\n').map(l => l.trim()).filter(l => l.startsWith('-')).map(l => l.replace(/^-\s*/, '').trim()).filter(Boolean)
+  return { summary: summary || text.trim(), decisions: decisions.slice(0, 8) }
+}
 
 /** Quiet sessions get a model-written summary in place of the template (one at a time). */
 async function digestOne($: EngineInterface, agents: ShadowAgent[]) {
@@ -339,10 +353,11 @@ async function digestOne($: EngineInterface, agents: ShadowAgent[]) {
       rec.last_agent ? `The agent's last reply:\n${clip(rec.last_agent, 800)}` : '',
       rec.open_thread ? `It is waiting on: ${rec.open_thread}` : '',
     ].filter(Boolean).join('\n\n')
-    const r = await $.model.complete({ model: cfg.ghostModel, system: DIGEST_SYSTEM, prompt, maxTokens: 220, timeoutMs: 20000 })
+    const r = await $.model.complete({ model: cfg.ghostModel, system: DIGEST_SYSTEM, prompt, maxTokens: 320, timeoutMs: 20000 })
     if (r.isAnswered && r.text.trim()) {
-      await post($, `/sessions/${encodeURIComponent(target.id)}/digest`, { text: r.text.trim(), by: cfg.ghostModel })
-      await update($, agentsAtom, list => list.map(a => (a.id === target.id ? { ...a, digest: r.text.trim(), needsDigest: false } : a)))
+      const { summary, decisions } = parseDigest(r.text)
+      await post($, `/sessions/${encodeURIComponent(target.id)}/digest`, { text: summary, by: cfg.ghostModel, decisions })
+      await update($, agentsAtom, list => list.map(a => (a.id === target.id ? { ...a, digest: summary, needsDigest: false } : a)))
     }
   } finally {
     isDigesting = false
@@ -641,7 +656,14 @@ export const register: Register = (on, options) => {
     const threads = await read($, threadsAtom)
     const openAgent = await read($, openAgentAtom)
     const dot = (s: ShadowAgent['state']) => (s === 'active' ? THEME.signal : s === 'idle' ? THEME.warn : THEME.muted)
-    const shown = agents.slice(0, isDocked ? 5 : 2)
+    // What agents are doing now: current sessions first; ended ones (over a day
+    // quiet) only as a short "earlier" list when nothing is current.
+    const liveAgents = agents.filter(a => a.state !== 'ended')
+    const isEarlier = liveAgents.length === 0
+    const shown = (isEarlier ? agents.slice(0, 3) : liveAgents).slice(0, isDocked ? 5 : 2)
+    // A raw command says little about the work; the file being edited or the goal says more.
+    const summaryLine = (a: ShadowAgent) =>
+      a.doing.startsWith('editing ') ? a.doing : a.goal ? `goal: ${a.goal}` : a.doing
     const problems = Object.entries(await read($, problemsAtom))
     const agentsSection = online ? (
       <Box key="agents" flexDirection="column">
@@ -651,17 +673,22 @@ export const register: Register = (on, options) => {
         ))}
         {shown.length === 0 ? (
           <Text key="agents-none" color={THEME.muted} wrap="wrap">No other agent sessions yet. Codex and Antigravity show up here as they work.</Text>
-        ) : (
+        ) : null}
+        {isEarlier && shown.length ? (
+          <Text key="agents-earlier" color={THEME.muted}>{'  '}nothing running now · earlier:</Text>
+        ) : null}
+        {shown.length === 0 ? null : (
           shown.map((a, i) => (
             <Box key={`agent-${i}`} flexDirection="column">
               <Text key="row" wrap="truncate-end">
                 <Text color={dot(a.state)}>●</Text> <Text color={THEME.text} bold>{a.label}</Text>
                 <Text color={THEME.muted}> · {a.projectName} · {ago(a.last)}</Text>
               </Text>
-              <Text key="doing" color={THEME.muted} wrap="truncate-end">{'  '}{a.doing || clip(a.goal, width)}</Text>
+              <Text key="doing" color={THEME.muted} wrap="truncate-end">{'  '}{clip(summaryLine(a), width * 2)}</Text>
               {openAgent === a.id ? (
                 <Box key="detail" flexDirection="column">
-                  {a.goal ? <Text key="goal" color={THEME.text} wrap="wrap">{'  '}goal: {clip(a.goal, 200)}</Text> : null}
+                  {a.goal && summaryLine(a) !== `goal: ${a.goal}` ? <Text key="goal" color={THEME.text} wrap="wrap">{'  '}goal: {clip(a.goal, 200)}</Text> : null}
+                  {a.doing && a.doing !== summaryLine(a) ? <Text key="last" color={THEME.muted} wrap="wrap">{'  '}last: {clip(a.doing, 120)}</Text> : null}
                   {a.digest ? <Text key="digest" color={THEME.text} wrap="wrap">{'  '}{clip(a.digest, 500)}</Text> : null}
                   {a.openThread ? <Text key="waiting" color={THEME.warn} wrap="wrap">{'  '}waiting on: {a.openThread}</Text> : null}
                 </Box>

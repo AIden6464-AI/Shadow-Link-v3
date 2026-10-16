@@ -40,12 +40,15 @@ def _toml_literal(s: str) -> str:
     return f"'{s}'"
 
 
-def connect_codex(home: Path, dry_run: bool = False) -> str:
+def connect_codex(home: Path, dry_run: bool = False, auto_approve: bool = False) -> str:
     cfg = home / ".codex" / "config.toml"
     if not cfg.parent.exists():
         return "Codex CLI not found (no ~/.codex); skipped."
     text = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
     if f"[mcp_servers.{SERVER_NAME}]" in text:
+        if auto_approve and "default_tools_approval_mode" not in text.split(f"[mcp_servers.{SERVER_NAME}]", 1)[1].split("\n[", 1)[0]:
+            return (f"Codex: already connected ({cfg}). To stop Codex asking before each Shadow tool, add "
+                    f"default_tools_approval_mode = \"approve\" under [mcp_servers.{SERVER_NAME}].")
         return f"Codex: already connected ({cfg})."
     cmd, args = _server_command()
     block = (
@@ -53,6 +56,8 @@ def connect_codex(home: Path, dry_run: bool = False) -> str:
         f"command = {_toml_literal(cmd)}\n"
         f"args = [{', '.join(_toml_literal(a) for a in args)}]\n"
         "startup_timeout_sec = 30\n"
+        # Off by default: Codex asks before each Shadow tool call unless you opt in.
+        + ('default_tools_approval_mode = "approve"\n' if auto_approve else "")
     )
     if dry_run:
         return f"Codex: would add to {cfg}:{block}"
@@ -85,11 +90,12 @@ def connect_antigravity(home: Path, dry_run: bool = False) -> str:
     return f"Antigravity: connected ({cfg}){f'; backup at {backup}' if backup else ''}."
 
 
-def connect(targets: list[str], home: Path | None = None, dry_run: bool = False) -> list[str]:
+def connect(targets: list[str], home: Path | None = None, dry_run: bool = False,
+            auto_approve: bool = False) -> list[str]:
     home = home or Path.home()
     out = []
     if "codex" in targets:
-        out.append(connect_codex(home, dry_run))
+        out.append(connect_codex(home, dry_run, auto_approve))
     if "antigravity" in targets:
         out.append(connect_antigravity(home, dry_run))
     return out

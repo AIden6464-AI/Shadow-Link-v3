@@ -628,13 +628,23 @@ class SessionStore:
             if self.store.get_node(tid):
                 self.store.set_status(tid, "archived")
 
-    def set_digest(self, node_id: str, text: str, by: str) -> dict | None:
+    def set_digest(self, node_id: str, text: str, by: str,
+                   decisions: list[str] | None = None) -> dict | None:
+        """Store a summary; `decisions` a model found are remembered like the ones patterns find."""
         rec = self.load(node_id)
         if rec is None:
             return None
         rec["digest"] = redact(_clip(text, 1500))
         rec["digest_by"] = by
         rec["digest_at"] = time.time()
+        rec.setdefault("decisions", [])
+        known = {d["text"].lower() for d in rec["decisions"]}
+        for d in decisions or []:
+            d = redact(_clip(str(d).strip().lstrip("-• ").strip(), 300))
+            if len(d) >= 6 and d.lower() not in known:
+                known.add(d.lower())
+                rec["decisions"] = (rec["decisions"] + [{"text": d, "ts": rec["last"], "by": by}])[-10:]
+                _dirty(rec)["decisions"].append(d)
         self.save(rec)
         did = f"D-{node_id[2:]}"
         if self.store.get_node(did):
@@ -852,7 +862,8 @@ class SessionTracker:
         rebuilt; summaries a model wrote and handoffs are kept.
         """
         with self._lock:
-            kept = {r["id"]: (r["digest"], r["digest_by"], r.get("digest_at", 0.0))
+            kept = {r["id"]: (r["digest"], r["digest_by"], r.get("digest_at", 0.0),
+                              [d["text"] for d in r.get("decisions", []) if d.get("by")])
                     for r in self.sessions.all() if r.get("digest_by") not in ("", "template")}
             derived = self.store._ids_where(
                 "type IN ('agent_session', 'activity', 'open_thread') OR (type = 'digest' AND source = 'template')"
@@ -862,10 +873,10 @@ class SessionTracker:
             self.store.set_meta(_CURSOR_KEY, {})
         self.poll_once()
         with self._lock:
-            for sid, (digest, by, at) in kept.items():
-                rec = self.sessions.load(sid)
+            for sid, (digest, by, at, decisions) in kept.items():
+                rec = self.sessions.set_digest(sid, digest, by, decisions)
                 if rec is not None:
-                    rec.update(digest=digest, digest_by=by, digest_at=at)
+                    rec["digest_at"] = at
                     self.sessions.save(rec)
                     self._records[sid] = rec
         return len(self.sessions.all())
@@ -880,10 +891,11 @@ class SessionTracker:
                     self._records.pop(sid)
             return out
 
-    def set_digest(self, session_id: str, text: str, by: str) -> dict | None:
+    def set_digest(self, session_id: str, text: str, by: str,
+                   decisions: list[str] | None = None) -> dict | None:
         """Store a client's digest without racing the poll loop's own save."""
         with self._lock:
-            rec = self.sessions.set_digest(session_id, text, by)
+            rec = self.sessions.set_digest(session_id, text, by, decisions)
             if rec is not None:
                 self._records[session_id] = rec
             return rec

@@ -1015,8 +1015,9 @@ class ShadowLinkAPIHandler(BaseHTTPRequestHandler):
                     self.send_error(400, "Parameter 'text' must be a non-empty string")
                     return
                 by = str(data.get("by") or "client")
-                rec = (tracker_mod.TRACKER.set_digest(sid, text.strip(), by) if tracker_mod.TRACKER
-                       else sessions.set_digest(sid, text.strip(), by))
+                decisions = [str(d) for d in data.get("decisions") or [] if isinstance(d, str)][:10]
+                rec = (tracker_mod.TRACKER.set_digest(sid, text.strip(), by, decisions) if tracker_mod.TRACKER
+                       else sessions.set_digest(sid, text.strip(), by, decisions))
                 if rec is None:
                     self.send_error(404, "Unknown session")
                     return

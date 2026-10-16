@@ -79,12 +79,12 @@ The plugin lives in [`plugin/`](plugin/).
 
 ## Shadow across your agents
 
-`shadow-link daemon` keeps track of what every coding agent is doing: Claude Code, Codex CLI, Antigravity CLI and the Antigravity IDE. It reads each agent's own session files as they grow, records per session what you asked, the decisions you made, files changed, commands and tests (pass or fail), errors and the question it left open, and keeps it in Shadow's memory (the ACA graph) with your past replies. Credentials are redacted before anything is stored, and pasted terminal output or logs are never mistaken for your own words. See [`docs/SHADOW_CORE_PLAN.md`](docs/SHADOW_CORE_PLAN.md).
+`shadow-link daemon` keeps track of what every coding agent is doing: Claude Code, Codex CLI, Antigravity CLI and the Antigravity IDE. It reads each agent's own session files as they grow, records per session what you asked, the decisions you made (spotted in what you type, and picked out by Haiku when it summarises a quiet session), files changed, commands and tests (pass or fail), errors and the question it left open, and keeps it in Shadow's memory (the ACA graph) with your past replies. Credentials are redacted before anything is stored, and pasted terminal output or logs are never mistaken for your own words. See [`docs/SHADOW_CORE_PLAN.md`](docs/SHADOW_CORE_PLAN.md).
 
 Handing work over is always on request, and Shadow never sends anything to an agent itself:
 
 - **In Claude Code:** `hand over` in the sidebar, or `/shadow handoff codex`, puts a short brief (goal, where it stands, files, commands, tests, errors, your last requests) in the chat bar.
-- **In Codex or Antigravity:** run `shadow-link connect` once. It adds Shadow's MCP server to `~/.codex/config.toml` and `~/.gemini/config/mcp_config.json` (backing them up first). Then ask, for example, "what is Claude doing? use shadow_sessions" or "pick up the Claude session with shadow_handoff".
+- **In Codex or Antigravity:** run `shadow-link connect` once. It adds Shadow's MCP server to `~/.codex/config.toml` and `~/.gemini/config/mcp_config.json` (backing them up first). Then ask, for example, "what is Claude doing? use shadow_sessions" or "pick up the Claude session with shadow_handoff". Codex asks before each Shadow tool call; `shadow-link connect codex --auto-approve` lets it call them without asking.
 - **Anywhere:** `shadow-link sessions` lists them; `shadow-link handoff <id> --to-file` writes `.shadow/handoff.md` for any agent to read.
 
 When a brief is sent on, Shadow links the session that picked it up to the one it came from, so later questions can follow the chain.

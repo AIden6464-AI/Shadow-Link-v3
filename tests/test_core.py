@@ -270,13 +270,17 @@ def test_rebuild_rereads_and_keeps_model_summaries(home: Path, tmp_path: Path):
     tr = _tracker(home, tmp_path)
     tr.poll_once()
     codex = [s for s in tr.sessions.list() if s["agent"] == "codex"][0]
-    tr.set_digest(codex["id"], "Codex added rate limiting; npm test fails.", "haiku")
+    tr.set_digest(codex["id"], "Codex added rate limiting; npm test fails.", "haiku",
+                  ["Rate limit per API key, not per IP"])
+    assert any(n["content"] == "Rate limit per API key, not per IP"
+               for n in tr.sessions._linked(codex["id"], "decision"))
     before = {s["id"]: s for s in tr.sessions.list()}
     assert tr.rebuild() == 3
     after = {s["id"]: s for s in tr.sessions.list()}
     assert set(after) == set(before)
     assert after[codex["id"]]["digest"] == "Codex added rate limiting; npm test fails."
     rec = tr.sessions.load(codex["id"])
+    assert [d["text"] for d in rec["decisions"]] == ["Rate limit per API key, not per IP"]   # kept
     assert rec["requests"].count("add rate limiting to the api") == 1         # read once, not twice
     assert list(rec["files"].values())[0]["edits"] == 1
 
@@ -322,6 +326,10 @@ def test_connect_writes_configs_once(tmp_path: Path):
     assert cfg["mcpServers"]["shadow-link"]["args"] == ["-m", "shadow_link.cli", "mcp"]
     again = connect(["codex", "antigravity"], home=tmp_path)
     assert all("already connected" in line for line in again)
+    assert "default_tools_approval_mode" not in toml                         # Codex asks unless you opt in
+    (tmp_path / "h2/.codex").mkdir(parents=True)
+    connect(["codex"], home=tmp_path / "h2", auto_approve=True)
+    assert 'default_tools_approval_mode = "approve"' in (tmp_path / "h2/.codex/config.toml").read_text(encoding="utf-8")
 
 
 def test_session_endpoints(home: Path, tmp_path: Path, monkeypatch):

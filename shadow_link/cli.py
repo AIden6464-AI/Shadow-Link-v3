@@ -200,7 +200,7 @@ def handle_forget(args):
 def handle_connect(args):
     from shadow_link.connect import connect
     targets = ["codex", "antigravity"] if args.agent == "all" else [args.agent]
-    for line in connect(targets, dry_run=args.dry_run):
+    for line in connect(targets, dry_run=args.dry_run, auto_approve=args.auto_approve):
         print(line)
     if not args.dry_run:
         print("Restart those CLIs, then ask them e.g. \"what is Claude doing? use shadow_sessions\" "
@@ -485,6 +485,8 @@ def main():
     connect_parser = subparsers.add_parser("connect", help="Give Codex / Antigravity Shadow's MCP tools (sessions, recall, handoff)")
     connect_parser.add_argument("agent", nargs="?", default="all", choices=["all", "codex", "antigravity"])
     connect_parser.add_argument("--dry-run", action="store_true", help="Show the change without writing it")
+    connect_parser.add_argument("--auto-approve", action="store_true",
+                                help="Let Codex call Shadow's tools without asking each time (off by default)")
     connect_parser.set_defaults(func=handle_connect)
 
     reclassify_parser = subparsers.add_parser("reclassify", help="Re-sort stored replies with the current categorizer")
