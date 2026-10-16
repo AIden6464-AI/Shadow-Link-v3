@@ -38,6 +38,8 @@ NODE_TYPES = frozenset({
     "conversation", "finding", "test_result", "research", "dependency",
     "entity", "architecture", "episode", "semantic", "procedure", "observation",
     "event",
+    # Shadow Core: what every coding agent is doing (see docs/SHADOW_CORE_PLAN.md)
+    "agent_session", "activity", "open_thread", "handoff", "project", "digest",
 })
 
 NODE_STATUSES = frozenset({
@@ -59,6 +61,8 @@ DEFAULT_TRUST: dict[str, float] = {
     "episode": 0.85, "reaction": 0.8, "memory": 0.75, "semantic": 0.75,
     "finding": 0.78, "conversation": 0.7, "dependency": 0.95, "entity": 0.9,
     "event": 0.9, "hypothesis": 0.31,
+    "agent_session": 0.95, "activity": 0.95, "open_thread": 0.85, "handoff": 0.9,
+    "project": 0.98, "digest": 0.85,
 }
 
 # Freshness half-life (hours) by node type; inf = does not go stale.
@@ -71,6 +75,8 @@ HALF_LIFE_HOURS: dict[str, float] = {
     "finding": 24 * 3, "conversation": 24 * 3, "task": 24 * 7,
     "hypothesis": 24, "error": 12, "test_result": 6, "tool_result": 6,
     "observation": 6, "event": 6,
+    "agent_session": 24 * 30, "activity": 24 * 14, "open_thread": 24 * 14,
+    "handoff": 24 * 30, "project": math.inf, "digest": 24 * 90,
 }
 
 _STOP = frozenset("""

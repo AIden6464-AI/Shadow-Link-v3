@@ -2,6 +2,11 @@
 Shadow Link — Claude Code UserPromptSubmit hook for v3.
 
 Captures reaction pairs and predictive context dynamically.
+
+Deprecated: the Shadow Link Claude Code plugin (plugin/) now captures every
+reply you send and shows Shadow's context in its sidebar, so this hook is no
+longer needed. It keeps working in this release and is removed in a later one
+(docs/SHADOW_CORE_PLAN.md, phase 5). Remove it from your settings.json hooks.
 """
 
 from __future__ import annotations

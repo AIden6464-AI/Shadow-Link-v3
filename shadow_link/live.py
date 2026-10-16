@@ -244,6 +244,7 @@ def is_real_reply(text: str) -> bool:
         "Shadow Link context",
         "Caveat:", "Shell cwd was reset",
         "The following is the Codex agent history",   # Codex's approval reviewer, not a person
+        "# Files mentioned by the user:",             # Codex attachments with no words of the person's
         "A session-scoped Stop hook is now active",
         "CORPUS SHAPE", "SHADOW LINK", "GHOST (", "[CLAUDE]", "[GHOST",
     )

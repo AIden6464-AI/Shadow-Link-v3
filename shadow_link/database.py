@@ -100,14 +100,16 @@ class Database:
         """
         Leak-proof connection context manager.
         """
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         try:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -151,28 +153,38 @@ class Database:
         DUPLICATE_WINDOW_SECONDS). Short replies such as "continue" sent to
         different situations stay separate pairs. Returns (id, created).
         """
+        if bucket not in BUCKETS:
+            raise ValueError(f"Unknown bucket '{bucket}'. Valid: {BUCKETS}")
         text = text.strip()
         meta = metadata or {}
         situation = _norm_situation(meta)
         now = time.time()
+        # The hook process, the plugin, the proxy and the watcher can capture the
+        # same reply at once: look and insert under one write lock so only one wins.
         with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT id, created_at, metadata FROM prompts WHERE text = ? ORDER BY id DESC LIMIT 50",
                 (text,),
             ).fetchall()
-        for r in rows:
-            try:
-                other = json.loads(r["metadata"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                other = {}
-            other_situation = _norm_situation(other)
-            if situation and other_situation:
-                duplicate = _same_situation(situation, other_situation)
-            else:
-                duplicate = now - float(r["created_at"]) <= DUPLICATE_WINDOW_SECONDS
-            if duplicate:
-                return int(r["id"]), False
-        return self.add_prompt(text, bucket, weight, meta), True
+            for r in rows:
+                try:
+                    other = json.loads(r["metadata"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    other = {}
+                other_situation = _norm_situation(other)
+                if situation and other_situation:
+                    duplicate = _same_situation(situation, other_situation)
+                else:
+                    duplicate = now - float(r["created_at"]) <= DUPLICATE_WINDOW_SECONDS
+                if duplicate:
+                    return int(r["id"]), False
+            new_id = conn.execute(
+                "INSERT INTO prompts (text, bucket, weight, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
+                (text, bucket, weight, now, json.dumps(meta)),
+            ).lastrowid
+        self._update_edges_for(new_id)
+        return int(new_id), True
 
     def get_prompt(self, prompt_id: int) -> dict | None:
         with self._connection() as conn:
@@ -360,6 +372,26 @@ class Database:
             }
             edges = conn.execute("SELECT COUNT(*) FROM prompt_edges").fetchone()[0]
         return {"total_prompts": total, "by_bucket": by_bucket, "total_edges": edges}
+
+    def reclassify(self) -> int:
+        """Re-run the categorizer over every stored reply; returns rows changed."""
+        from shadow_link.ingester import classify_multi
+        changed = 0
+        with self._connection() as conn:
+            rows = conn.execute("SELECT id, text, bucket, metadata FROM prompts").fetchall()
+            for r in rows:
+                try:
+                    meta = json.loads(r["metadata"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+                buckets = classify_multi(r["text"])
+                if buckets[0] == r["bucket"] and meta.get("buckets") == buckets:
+                    continue
+                meta["buckets"] = buckets
+                conn.execute("UPDATE prompts SET bucket = ?, metadata = ? WHERE id = ?",
+                             (buckets[0], json.dumps(meta), r["id"]))
+                changed += 1
+        return changed
 
     def clear(self) -> None:
         """Clear all prompts and edges from the database."""

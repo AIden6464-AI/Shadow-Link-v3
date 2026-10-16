@@ -1,6 +1,8 @@
 # Shadow Core plan
 
-Status: draft for review. Nothing is deleted until the phase that says so.
+Status: phases 1 to 5 built. Phase 5 is the warning release: the old pieces still work and print what replaces them; removing them is a later release, with your sign-off.
+
+Defaults taken for the open questions below: every project is tracked; digests name files without code diffs; Claude Code, Codex and Antigravity are covered, and any other agent can report through `shadow_report`.
 
 ## Goal
 
@@ -39,7 +41,7 @@ Each agent reports **events**. The core groups events into **sessions**: one age
 
 | Agent | How events arrive | Notes |
 |---|---|---|
-| Claude Code | The plugin posts `turn.complete` and `tool.call` events (tool name, files touched, command, result status) to `POST /track/event`. | Instant. If the plugin is off, the transcript tail is the fallback. |
+| Claude Code | The daemon tails `~/.claude/projects/*/*.jsonl` (tool calls, files, commands and results are all in the transcript). | Built this way instead of plugin events, so a session is never counted twice; the plugin reads the result for its AGENTS list. |
 | Codex CLI | The daemon tails `~/.codex/sessions/**/rollout-*.jsonl`, reusing `_codex_sessions` parsing incrementally. | Don't use Codex's `notify` setting: your config already uses its single slot for computer-use. |
 | Antigravity CLI | The daemon tails `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`. | Same parser as the import. |
 | Any MCP agent | It calls the MCP tool `shadow.report(what, files, status)`. | Optional, for agents with no readable history. |

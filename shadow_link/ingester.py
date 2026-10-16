@@ -15,10 +15,12 @@ from typing import Any, Dict, List
 from shadow_link.database import Database, BUCKETS
 from shadow_link.tokenizer import tokenize
 
+# Matched as whole words or phrases ("bad" never matches "badge"). Asking for
+# something to be removed or cleaned up is a request, not a rejection, so those
+# verbs are not here.
 KEYWORDS_REJECTION = {
-    "too bloated", "bloated", "strip", "wipe", "boilerplate", "remove", 
-    "clean", "cliché", "corporate jargon", "bad", "wrong", "revert", "delete",
-    "stop writing", "don't need", "unnecessary"
+    "too bloated", "bloated", "boilerplate", "cliché", "corporate jargon", "bad",
+    "wrong", "revert", "undo", "stop writing", "don't need", "unnecessary", "overkill",
 }
 
 KEYWORDS_REMINDER = {
@@ -43,6 +45,17 @@ _NEGATION_RE = re.compile(
     r"\b(?:do not|don't|dont|does not|doesn't|never|avoid|stop using|no need)\b")
 
 
+def _phrase_re(words: set[str]) -> re.Pattern:
+    alts = sorted((re.escape(w) for w in words), key=len, reverse=True)
+    return re.compile(r"(?<![\w'])(?:" + "|".join(alts) + r")(?![\w'])")
+
+
+_REJECTION_RE = _phrase_re(KEYWORDS_REJECTION)
+_CORRECTION_RE = _phrase_re(KEYWORDS_CORRECTION)
+_PIVOT_RE = _phrase_re(KEYWORDS_PIVOT)
+_REMINDER_RE = _phrase_re(KEYWORDS_REMINDER)
+
+
 def classify_by_heuristics(text: str) -> str:
     """Helper to classify text into a single primary bucket based on keywords."""
     return classify_multi(text)[0]
@@ -53,13 +66,13 @@ def classify_multi(text: str) -> list[str]:
     """
     text_lower = text.lower()
     hits: list[str] = []
-    if any(kw in text_lower for kw in KEYWORDS_REJECTION) or _NEGATION_RE.search(text_lower):
+    if _REJECTION_RE.search(text_lower) or _NEGATION_RE.search(text_lower):
         hits.append("rejection")
-    if any(kw in text_lower for kw in KEYWORDS_CORRECTION):
+    if _CORRECTION_RE.search(text_lower):
         hits.append("correction")
-    if any(kw in text_lower for kw in KEYWORDS_PIVOT):
+    if _PIVOT_RE.search(text_lower):
         hits.append("pivot")
-    if any(kw in text_lower for kw in KEYWORDS_REMINDER):
+    if _REMINDER_RE.search(text_lower):
         hits.append("reminder")
     return hits or ["request"]
 

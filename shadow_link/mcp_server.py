@@ -166,6 +166,85 @@ def shadow_aca_feedback(task_id: str, node_id: str, useful: bool = True) -> str:
     """
     return json.dumps(_get_aca().feedback(task_id, node_id, useful), default=str)
 
+# ------------------------------------------------ Shadow Core: every agent's work
+# Sessions are tracked by `shadow-link daemon` (it tails Claude Code, Codex and
+# Antigravity); these tools read that memory and build handoffs on request.
+
+def _sessions():
+    from shadow_link.tracker import SessionStore
+    return SessionStore(_get_aca().store)
+
+
+@mcp.tool()
+def shadow_sessions(project: str = "", agent: str = "", active_only: bool = False, limit: int = 10) -> str:
+    """
+    What every coding agent is doing: recent Claude Code, Codex and Antigravity
+    sessions with their project, state (active/idle/ended), what they are doing
+    now, files changed, and any question they left open. Pass `project` (a folder
+    path) to see only work in one repo. Use a session `id` with shadow_handoff.
+    """
+    return json.dumps({"sessions": _sessions().list(project=project, agent=agent,
+                                                     active_only=active_only, limit=limit)}, indent=2)
+
+
+@mcp.tool()
+def shadow_activity(session: str) -> str:
+    """
+    One session's timeline: goal, recent requests, files changed, commands run
+    (with pass/fail), test runs, errors and the digest. `session` is an id from
+    shadow_sessions.
+    """
+    rec = _sessions().load(session)
+    if rec is None:
+        return json.dumps({"error": f"Unknown session '{session}'"})
+    keep = ("agent", "project", "goal", "requests", "files", "commands", "tests", "errors",
+            "open_thread", "digest", "last_agent")
+    return json.dumps({k: rec[k] for k in keep}, indent=2, default=str)
+
+
+@mcp.tool()
+def shadow_recall(question: str, project: str = "") -> str:
+    """
+    Ask Shadow's memory a question ("what touched auth.ts last week?", "did I
+    decide on postgres?"). Activates related sessions, file edits, digests,
+    decisions and past replies, and says why each came up.
+    """
+    out = _get_aca().process(question, kind="prompt", project=project, remember=False)
+    items = [{"type": i.get("type"), "title": i.get("title"), "content": str(i.get("content", ""))[:400],
+              "why": (i.get("why") or {}).get("seed_reason", "")} for i in out.get("context", [])]
+    return json.dumps({"context": items}, indent=2, default=str)
+
+
+@mcp.tool()
+def shadow_handoff(from_session: str, to_agent: str = "") -> str:
+    """
+    Build a handoff brief from another agent's session so you can continue its
+    work: goal, where it stands, files changed, recent commands and tests,
+    errors, the user's latest requests and any open question. Only call this
+    when the user asks to pick up or hand over work.
+    """
+    from shadow_link.tracker import build_handoff
+    packet = build_handoff(_get_aca().store, from_session, to_agent)
+    if packet is None:
+        return json.dumps({"error": f"Unknown session '{from_session}'. List them with shadow_sessions."})
+    return packet["markdown"]
+
+
+@mcp.tool()
+def shadow_report(agent: str, what: str, project: str = "", files: list[str] | None = None,
+                  command: str = "", status: str = "") -> str:
+    """
+    Tell Shadow what you (the agent) just did, for agents whose sessions Shadow
+    cannot read on its own. `project` is the working folder; `status` is "ok" or
+    "error" for a command you ran.
+    """
+    from shadow_link.tracker import SessionTracker, TRACKER
+    tr = TRACKER or SessionTracker(cfg.db_path)
+    sid = tr.report(agent, what, project=project, files=files or [], command=command,
+                    status=status if status in ("ok", "error") else None)
+    return json.dumps({"session": sid})
+
+
 def run_mcp_server():
     mcp.run(transport="stdio")
 
