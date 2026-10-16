@@ -222,16 +222,28 @@ def read_tail_lines(path: str, max_bytes: int = 4_000_000, chunk: int = 65_536):
         return
 
 
+_IMAGE_REF_RE = re.compile(r"\[Image[^\]]*\]|<image>\s*</image>")
+# A turn that opens with a tag (<image>, <codex_internal_context ...>,
+# <send_user_message_question_reply>) is a tool's wrapper, not typed text.
+_WRAPPER_RE = re.compile(r"^<[A-Za-z_][\w-]*[\s>]")
+
+
+def clean_reply(text: str) -> str:
+    """What the person typed, without image placeholders such as "[Image #2]"."""
+    return re.sub(r"[ 	]{2,}", " ", _IMAGE_REF_RE.sub(" ", text or "")).strip()
+
+
 def is_real_reply(text: str) -> bool:
     """Filter out non-reactions: slash commands, CC wrappers, nudges, trivia."""
-    t = (text or "").strip()
-    if len(t) < 4 or t.startswith("/"):
+    t = clean_reply(text)
+    if len(t) < 4 or t.startswith("/") or _WRAPPER_RE.match(t):
         return False
     markers = (
         "<command-name>", "<command-message>", "<local-command", "<system-reminder",
         "<bash-", "[Request interrupted", "Shadow Link — based on past reactions",
         "Shadow Link context",
-        "Caveat:", "Shell cwd was reset", "[Image",
+        "Caveat:", "Shell cwd was reset",
+        "The following is the Codex agent history",   # Codex's approval reviewer, not a person
         "A session-scoped Stop hook is now active",
         "CORPUS SHAPE", "SHADOW LINK", "GHOST (", "[CLAUDE]", "[GHOST",
     )
@@ -394,6 +406,7 @@ class LiveWatcher:
         elif role == "user":
             if not is_real_reply(text):
                 return
+            text = clean_reply(text)
             with self._lock:
                 claude = self._last_claude
                 dup = (text == self._last_captured)

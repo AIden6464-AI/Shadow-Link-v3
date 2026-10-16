@@ -303,10 +303,10 @@ def learn_pair(payload: dict, request_id: str) -> dict | None:
         return None
     user_text = _operator_text(user_msg.get("content"))
     asst_text = _assistant_text(asst_msg.get("content"))
-    from shadow_link.live import is_real_reply
+    from shadow_link.live import clean_reply, is_real_reply
     if not (user_text and asst_text and is_real_reply(user_text)):
         return None
-    return {"question": asst_text, "response": user_text, "request_id": request_id}
+    return {"question": asst_text, "response": clean_reply(user_text), "request_id": request_id}
 
 
 def _send_pair(pair: dict) -> None:

@@ -302,8 +302,74 @@ class Ingester:
         imported = self.db.bulk_add_reactions(items)
         return {"imported": imported, "skipped": skipped, "candidates": len(seen) + skipped}
 
+    def ingest_agent_sessions(self, sources: tuple[str, ...] = ("claude", "codex", "agy"),
+                              home: Path | None = None) -> dict:
+        """
+        Import reaction pairs (agent reply -> what you typed next) from local
+        coding-agent CLI histories: Claude Code (~/.claude/projects), Codex CLI
+        (~/.codex/sessions) and Antigravity CLI (~/.gemini/antigravity-cli/brain).
+        Pairs already stored are skipped, so it is safe to run again.
+        """
+        import time
+        from shadow_link.live import clean_reply, is_real_reply
+
+        home = Path(home) if home else Path.home()
+        readers = {"claude": _claude_code_sessions, "codex": _codex_sessions, "agy": _antigravity_sessions}
+
+        existing: set[tuple[str, str]] = set()
+        for r in self.db.all_prompts():
+            try:
+                m = json.loads(r.get("metadata") or "{}")
+            except Exception:
+                m = {}
+            existing.add(((m.get("agent_output") or m.get("question") or "")[:1000], r["text"]))
+
+        now = time.time()
+        report: dict = {}
+        for source in sources:
+            items: list[dict] = []
+            seen: set[tuple[str, str]] = set()
+            skipped = sessions = 0
+            for name, turns in readers[source](home):
+                sessions += 1
+                last_situation = ""
+                for role, text, ts in turns:
+                    if role == "assistant":
+                        last_situation = text
+                        continue
+                    if last_situation and is_real_reply(text):
+                        text = clean_reply(text)
+                        key = (last_situation[:1000], text)
+                        if key in seen or key in existing:
+                            skipped += 1
+                        else:
+                            seen.add(key)
+                            buckets = classify_multi(text)
+                            items.append({
+                                "text": text,
+                                "bucket": buckets[0],
+                                "weight": 1.0,
+                                "created_at": ts or now,
+                                "triggered_at": now,
+                                "metadata": {
+                                    "buckets": buckets,
+                                    "source": f"{source}_cli",
+                                    "agent_output": last_situation[:1000],
+                                    "conversation": name,
+                                },
+                            })
+                    last_situation = ""
+            report[source] = {"sessions": sessions, "imported": self.db.bulk_add_reactions(items),
+                              "skipped": skipped}
+        return report
+
     def ingest_interaction(self, question: str, response: str, request_id: str) -> int:
-        """Ingests a single live human interaction (question/response pair)."""
+        """Ingests a single live human interaction (question/response pair).
+        Returns None when the response is not something the person typed."""
+        from shadow_link.live import clean_reply, is_real_reply
+        if not is_real_reply(response):
+            return None
+        response = clean_reply(response)
         timestamp = datetime.utcnow().isoformat() + "Z"
         metadata = {
             "source": "oneiros_live_ingest",
@@ -318,3 +384,100 @@ class Ingester:
             metadata=metadata,
             unique=True,   # live captures can arrive from the hook, watcher and proxy at once
         )
+
+
+# ---------------------------------------------------------------------------
+# Agent CLI session readers. Each yields (session_name, [(role, text, epoch)]),
+# role "user" (what the person typed) or "assistant" (the agent's reply text).
+
+def _epoch(value) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value) / (1000.0 if value > 1e12 else 1.0)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _jsonl(path: Path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
+def _claude_code_sessions(home: Path):
+    from shadow_link.live import operator_text, _extract_text
+    root = home / ".claude" / "projects"
+    for path in sorted(root.glob("*/*.jsonl")):          # top level only: subagent runs are not the person
+        turns = []
+        for o in _jsonl(path):
+            msg = o.get("message") or {}
+            role = msg.get("role")
+            if o.get("type") not in ("user", "assistant") or role not in ("user", "assistant"):
+                continue
+            if o.get("isMeta") or o.get("isSidechain"):
+                continue
+            content = msg.get("content", "")
+            text = operator_text(content) if role == "user" else _extract_text(content)
+            if text.strip():
+                turns.append((role, text.strip(), _epoch(o.get("timestamp"))))
+        yield f"{path.parent.name}/{path.stem}", turns
+
+
+# Codex wraps context it injects into the user turn in tags like these.
+_CODEX_INJECTED = ("<environment_context", "<user_instructions", "<permissions", "<turn_aborted",
+                   "# AGENTS.md", "<INSTRUCTIONS>", "<user_shell_command", "<skill")
+
+
+def _codex_sessions(home: Path):
+    root = home / ".codex" / "sessions"
+    for path in sorted(root.glob("**/rollout-*.jsonl")):
+        turns = []
+        for o in _jsonl(path):
+            p = o.get("payload") or {}
+            if o.get("type") != "response_item" or p.get("type") != "message":
+                continue
+            role = p.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            want = "input_text" if role == "user" else "output_text"
+            parts = [c.get("text", "") for c in p.get("content") or []
+                     if isinstance(c, dict) and c.get("type") == want]
+            if role == "user":
+                parts = [t for t in parts if not t.lstrip().startswith(_CODEX_INJECTED)]
+            text = "\n".join(t.strip() for t in parts if t.strip()).strip()
+            if role == "user" and "## My request for Codex:" in text:
+                # Attached files are listed first; the person's words follow this line.
+                text = text.split("## My request for Codex:", 1)[1].strip()
+            if text:
+                turns.append((role, text, _epoch(o.get("timestamp"))))
+        yield path.stem, turns
+
+
+_AGY_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
+
+
+def _antigravity_sessions(home: Path):
+    root = home / ".gemini" / "antigravity-cli" / "brain"
+    for path in sorted(root.glob("*/.system_generated/logs/transcript.jsonl")):
+        turns = []
+        for o in _jsonl(path):
+            kind, content = o.get("type"), o.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if kind == "USER_INPUT" and o.get("source") == "USER_EXPLICIT":
+                m = _AGY_REQUEST_RE.search(content)
+                if m and m.group(1).strip():
+                    turns.append(("user", m.group(1).strip(), _epoch(o.get("created_at"))))
+            elif kind == "PLANNER_RESPONSE" and o.get("source") == "MODEL":
+                turns.append(("assistant", content.strip(), _epoch(o.get("created_at"))))
+        yield path.parents[2].name, turns

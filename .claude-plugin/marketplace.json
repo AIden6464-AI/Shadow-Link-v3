@@ -3,12 +3,12 @@
   "owner": {
     "name": "Shadow Link"
   },
-  "description": "Shadow Link for Claude Code: your likely reply floating above the chat bar.",
+  "description": "Shadow Link for Claude Code: your likely reply in a sidebar beside the conversation.",
   "plugins": [
     {
       "name": "shadow-link",
       "source": "./plugin",
-      "description": "Shadow floats above the Claude Code chat bar: your likely reply, why, and a side chat that knows the session."
+      "description": "Shadow Link in a sidebar beside Claude Code: your likely reply drafted in your voice, why, and a side chat that knows the session."
     }
   ]
 }
